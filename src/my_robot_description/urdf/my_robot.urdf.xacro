@@ -16,8 +16,16 @@
           这是 skid-steer 的固有特性，实车同样存在，所以这里**保留**
           而不是消除——让上层的 SLAM/Nav2 面对和实车一样的里程计质量。
 
-       ★ 下面 7 个几何/质量/限速参数是按 0.4×0.3 底盘估的占位值，
-         请按实车实测值修改（尤其 wheel_offset_x = 半轴距）。
+       ★★ 下面这一段 property 是本工程**唯一**依赖实车实测数据的地方。
+          全部是按 0.4×0.3 底盘估的占位值，不是实测值。
+
+          拿到实车数据后怎么改：
+            1. 只改这一段（几何 / 质量 / 限速 / 摩擦 / 雷达，共 5 组）；
+            2. 不用 colcon build —— install 是符号链接，直接指向本文件；
+            3. 重启 launch 即可生效。
+
+          改哪个值要连带改哪里（Nav2、SLAM），见 docs/real_robot_params.md。
+          最要紧的是 wheel_offset_x（半轴距）和雷达安装高度 / 量程。
        ================================================================ -->
   <xacro:property name="base_length"  value="0.4"/>
   <xacro:property name="base_width"   value="0.3"/>
@@ -46,6 +54,20 @@
   <xacro:property name="max_angular_vel" value="1.5"/>
   <xacro:property name="max_linear_acc"  value="0.5"/>
   <xacro:property name="max_angular_acc" value="2.0"/>
+
+  <!-- ★ 雷达参数：同样是占位值，从未和实车雷达核对过。
+       雷达装高一点（比如 0.25）能少扫到地面；量程和角度要按实车型号改，
+       否则 SLAM 会把真实存在的墙当成"超出量程"而丢掉。 -->
+  <xacro:property name="lidar_mount_x"  value="0.0"/>    <!-- 相对 base_link -->
+  <xacro:property name="lidar_mount_y"  value="0.0"/>
+  <xacro:property name="lidar_mount_z"  value="0.12"/>
+  <xacro:property name="lidar_samples"  value="360"/>    <!-- 水平线数 -->
+  <xacro:property name="lidar_min_angle" value="-3.14159"/>
+  <xacro:property name="lidar_max_angle" value="3.14159"/>
+  <xacro:property name="lidar_range_min" value="0.1"/>
+  <xacro:property name="lidar_range_max" value="12.0"/>
+  <xacro:property name="lidar_update_rate" value="10"/>  <!-- Hz -->
+  <xacro:property name="lidar_noise_stddev" value="0.01"/> <!-- m -->
 
   <!-- ========== 驱动轮宏 ========== -->
   <xacro:macro name="drive_wheel" params="name x y">
@@ -152,7 +174,7 @@
   <joint name="laser_joint" type="fixed">
     <parent link="base_link"/>
     <child link="laser_frame"/>
-    <origin xyz="0.0 0 0.12" rpy="0 0 0"/>
+    <origin xyz="${lidar_mount_x} ${lidar_mount_y} ${lidar_mount_z}" rpy="0 0 0"/>
   </joint>
 
   <!-- ========== Gazebo 差速驱动插件 ==========
@@ -186,25 +208,25 @@
     <sensor name="lidar" type="gpu_lidar">
       <always_on>true</always_on>
       <visualize>true</visualize>
-      <update_rate>10</update_rate>
+      <update_rate>${lidar_update_rate}</update_rate>
       <topic>scan</topic>
       <gz_frame_id>laser_frame</gz_frame_id>
       <lidar>
         <scan>
           <horizontal>
-            <samples>360</samples>
-            <min_angle>-3.14159</min_angle>
-            <max_angle>3.14159</max_angle>
+            <samples>${lidar_samples}</samples>
+            <min_angle>${lidar_min_angle}</min_angle>
+            <max_angle>${lidar_max_angle}</max_angle>
           </horizontal>
         </scan>
         <range>
-          <min>0.1</min>
-          <max>12.0</max>
+          <min>${lidar_range_min}</min>
+          <max>${lidar_range_max}</max>
         </range>
         <noise>
           <type>gaussian</type>
           <mean>0.0</mean>
-          <stddev>0.01</stddev>
+          <stddev>${lidar_noise_stddev}</stddev>
         </noise>
       </lidar>
     </sensor>
