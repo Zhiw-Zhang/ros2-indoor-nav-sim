@@ -29,6 +29,13 @@ ros2 run nav2_map_server map_saver_cli -f ~/my_map
 | 地图尺寸 | 9.95 × 5.0 m（真值房间 10 × 5 m） |
 | 前 45 s 的 SLAM 定位误差 | < 5 cm |
 
+## RViz 里长这样
+
+![RViz 建图结果](slam_rviz_map.png)
+
+> Fixed Frame = `map`，红点是实时 `/scan`，黑格是建出来的地图，蓝色方块是机器人。
+> 视角是俯视正交（`TopDownOrtho`），打开就能看出墙体有没有闭合。
+
 ## ⚠️ 两处不改就一定建不出正确地图的配置
 
 这两条都写在 `config/slam_toolbox.yaml` 里对应参数的注释中，这里只讲结论。

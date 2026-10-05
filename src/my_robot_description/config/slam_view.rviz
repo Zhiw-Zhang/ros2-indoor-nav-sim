@@ -117,6 +117,30 @@ Visualization Manager:
     Current:
       Class: rviz_default_plugins/TF
   Value: true
+  # 俯视正交视角，建图时最直观。
+  # 注意两点，写错了 RViz 只会弹一个 "ViewController 'Current View' unavailable."
+  # 的小窗、其余照常，很容易漏掉：
+  #   1. Views 必须嵌在 Visualization Manager 下面，放根层级会被静默忽略；
+  #   2. 类名是 TopDownOrtho（rviz_default_plugins 里没有叫 Orthographic 的），
+  #      参数用 Scale（像素/米）和 X/Y 焦点，不是 Distance/Pitch/Yaw。
+  # Scale 65 ≈ 10 m 的房间占约 650 像素。
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.06
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.01
+      Scale: 65
+      Target Frame: <Fixed Frame>
+      Value: TopDownOrtho (rviz_default_plugins)
+      X: 0
+      Y: 0
+    Saved: ~
 Window Geometry:
   Displays:
     collapsed: false

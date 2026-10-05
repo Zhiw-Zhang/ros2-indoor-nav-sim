@@ -18,7 +18,11 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument,
+    GroupAction,
+    IncludeLaunchDescription,
+)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
@@ -33,11 +37,21 @@ def generate_launch_description():
     world = LaunchConfiguration('world')
 
     # 1. 仿真本体（rviz 交给下面这个带 SLAM 配置的 RViz）
-    sim_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(pkg_share, 'launch', 'gazebo_sim.launch.py')
-        ),
-        launch_arguments={'rviz': 'false', 'world': world}.items(),
+    #
+    #    必须用 GroupAction 把 rviz:=false 圈起来。直接写在
+    #    IncludeLaunchDescription 的 launch_arguments 里会**泄漏到外层上下文**，
+    #    把本文件自己的 rviz 也覆盖成 false —— 表现是 RViz 根本不启动，
+    #    而且日志里连一行都不留（launch 条件为假，节点压根没被创建），很难查。
+    sim_launch = GroupAction(
+        actions=[
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(pkg_share, 'launch', 'gazebo_sim.launch.py')
+                ),
+                launch_arguments={'world': world}.items(),
+            )
+        ],
+        launch_configurations={'rviz': 'false'},
         condition=IfCondition(sim),
     )
 
