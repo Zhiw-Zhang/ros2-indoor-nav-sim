@@ -78,9 +78,9 @@ skid-steer 原地旋转时四个轮子必须横向刮擦，编码器积分出来
 | `base_length` / `base_width` | Nav2 的 `footprint`（`config/nav2_params.yaml`） | 待建 |
 | `max_linear_vel` / `max_angular_vel` | Nav2 的 `max_vel_x` / `max_vel_theta`、`controller` 速度上限 | 待建 |
 | `max_linear_acc` / `max_angular_acc` | Nav2 的 `acc_lim_x` / `acc_lim_theta` | 待建 |
-| `lidar_range_max` | `slam_toolbox` 的 `max_laser_range` | 待建 |
+| `lidar_range_max` | `slam_toolbox` 的 `max_laser_range`（`config/slam_toolbox.yaml`） | ✅ 已建 |
 | `lidar_range_max` / `lidar_mount_z` | Nav2 costmap 的 `obstacle_max_range` / `raytrace_max_range` | 待建 |
-| `lidar_update_rate` / `lidar_noise_stddev` | `slam_toolbox` 的 `minimum_time_interval`、`correlation` 搜索窗 | 待建 |
+| `lidar_update_rate` / `lidar_noise_stddev` | `slam_toolbox` 的 `minimum_time_interval`、`correlation` 搜索窗 | ✅ 已建 |
 | `wheel_mu_lat` | 无需改配置，只影响里程计质量 | — |
 | `wheel_offset_*` / `wheel_radius` / 质量 | DiffDrive 参数由 xacro 自动推导，**无需另改** | ✅ |
 

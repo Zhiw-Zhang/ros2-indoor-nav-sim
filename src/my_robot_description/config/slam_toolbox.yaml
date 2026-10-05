@@ -1,0 +1,128 @@
+# slam_toolbox（online async）参数 —— 本机器人 / 本仿真专用
+#
+# ⚠️ 这个文件里有两处**不改就一定建不出正确地图**的地方，动手前先看：
+#     1. check_min_dist_and_heading_precisely: true（见"扫描匹配"一节）
+#        默认 false 时原地旋转的扫描全部被丢弃，地图会整体拧歪。
+#     2. loop_search_maximum_distance: 1.0（见"回环搜索"一节）
+#        上游默认 3.0 在这个 10×5 m 房间里会误匹配，地图上出现两份房间。
+#    这两处都是实测踩出来的，详细数据写在对应参数的注释里。
+#
+# 与官方默认 config/mapper_params_online_async.yaml 的差异，以及为什么：
+#   base_frame: base_link        —— 本机器人没有 base_footprint
+#   min/max_laser_range 0.1/12.0 —— 与 URDF 里 lidar_range_min/max 对齐
+#   minimum_time_interval: 0.1   —— 雷达 10 Hz，默认 0.5 会白白丢掉 4/5 的帧
+#   minimum_travel_distance: 0.2 —— 房间只有 10×5 m，默认 0.5 太粗
+#   map_update_interval: 1.0     —— 默认 5.0 s，建图过程看不出来
+#   enable_interactive_mode: false —— 没有 Nav2，"在 RViz 里把机器人挪过去"不可用
+#
+# ★ 依赖实车的量：max_laser_range（雷达量程）、minimum_time_interval（雷达频率）。
+#   改了 URDF 里的 lidar_* 参数后要回来同步，见 docs/real_robot_params.md。
+#
+# 建图质量实测（worlds/rooms.sdf，闭环路线约 23 m，与解析几何逐格比对）：
+#   占用格精度 100%（1671/1671 个占用格都落在真实墙面 15 cm 内）
+#   可见墙面覆盖率 88.4%，幻影墙 0 块
+slam_toolbox:
+  ros__parameters:
+
+    # ---- 求解器 ----
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None
+
+    # ---- 坐标系 / 话题 ----
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_link
+    scan_topic: /scan
+    use_map_saver: true
+    mode: mapping          # mapping | localization
+
+    use_sim_time: true
+
+    # ---- 基本参数 ----
+    debug_logging: false
+    throttle_scans: 1
+    transform_publish_period: 0.02   # 50 Hz 发布 map->odom
+    map_update_interval: 1.0
+    resolution: 0.05                 # 5 cm/格，和 Nav2 costmap 保持一致
+    restamp_tf: false
+    min_laser_range: 0.1             # = URDF lidar_range_min
+    max_laser_range: 12.0            # = URDF lidar_range_max
+    minimum_time_interval: 0.1       # = 1 / URDF lidar_update_rate
+    transform_timeout: 0.2
+    tf_buffer_duration: 30.0
+    stack_size_to_use: 40000000
+    enable_interactive_mode: false
+
+    # ---- 扫描匹配 ----
+    use_scan_matching: true
+    use_scan_barycenter: true
+    minimum_travel_distance: 0.2
+    minimum_travel_heading: 0.2
+
+    # ★★★ 必须为 true，否则原地旋转时地图完全不动 ★★★
+    #
+    # slam_toolbox_common.cpp 的 shouldProcessScan() 里：
+    #     const double dist2 = last_pose.SquaredDistance(pose);
+    #     if (check_min_dist_and_heading_precisely_) {
+    #         heading_diff = fabs(NormalizeAngle(pose.Heading() - last_pose.Heading()));
+    #         if (dist2 < min_dist2 && heading_diff < min_rotation) return false;
+    #     } else if (dist2 < 0.8 * min_dist2) {   // ← 默认走这一支
+    #         return false;
+    #     }
+    # 默认 false 时**只看平移距离，转角根本不参与判断**，于是"原地旋转"
+    # 永远被判成"没动"，扫描一个都不处理：地图冻结、map->odom 恒为 0，
+    # 里程计那 1.36 倍的转角偏差永远得不到纠正，最后整张地图会被拧歪。
+    # 实测：平移 0.8 m → 占用格 +249；原地旋转 6 rad → 占用格 +0（逐位相同）。
+    # 上游 issue：SteveMacenski/slam_toolbox#807、#499。
+    check_min_dist_and_heading_precisely: true
+
+    scan_buffer_size: 10
+    scan_buffer_maximum_scan_distance: 12.0
+    link_match_minimum_response_fine: 0.1
+    link_scan_maximum_distance: 1.5
+
+    # ★ 回环搜索半径必须明显小于房间尺度，否则会找到"假回环"
+    #
+    # 上游默认 3.0 m。在这个 10×5 m 的房间里，3.0 m 意味着几乎每个历史节点
+    # 都是候选，于是匹配到错误的位置，位姿图一优化就把当前节点整体挪走。
+    # 实测（同一段闭环路线）：
+    #   半径 3.0 m → 占用格精度 33.75%，幻影墙 104 块（最大 1615 格），
+    #                中途 SLAM 位姿一次性跳变 3.44 m，地图上出现两份重叠的房间
+    #   半径 1.0 m → 占用格精度 100%，幻影墙 0，覆盖率 88.4%
+    #   关掉回环   → 占用格精度 100%，幻影墙 0，覆盖率 92.6%
+    #
+    # 半径 1.0 既保住了回环能力（大场景需要），又不会误匹配：
+    # 经验法则是它要小于环境里"最窄的可区分特征间距"。
+    # 换到更大的场地（走廊/多房间）可以适当调大，但别一上来就用默认 3.0。
+    loop_search_maximum_distance: 1.0
+    do_loop_closing: true
+    loop_match_minimum_chain_size: 10
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
+    loop_match_minimum_response_fine: 0.45
+
+    # ---- 相关性搜索（位姿修正的搜索窗）----
+    correlation_search_space_dimension: 0.5
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.1
+
+    # ---- 回环搜索 ----
+    loop_search_space_dimension: 8.0
+    loop_search_space_resolution: 0.05
+    loop_search_space_smear_deviation: 0.03
+
+    # ---- 扫描匹配惩罚项 ----
+    distance_variance_penalty: 0.5
+    angle_variance_penalty: 1.0
+    fine_search_angle_offset: 0.00349
+    coarse_search_angle_offset: 0.349
+    coarse_angle_resolution: 0.0349
+    minimum_angle_penalty: 0.9
+    minimum_distance_penalty: 0.5
+    use_response_expansion: true
+    min_pass_through: 2
+    occupancy_threshold: 0.1
