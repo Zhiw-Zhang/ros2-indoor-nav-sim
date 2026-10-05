@@ -3,11 +3,13 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
+    DeclareLaunchArgument,
     IncludeLaunchDescription,
     OpaqueFunction,
     SetEnvironmentVariable,
     TimerAction,
 )
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import Command
 from launch_ros.actions import Node
@@ -105,6 +107,21 @@ def _launch_setup(context, *args, **kwargs):
         output='screen'
     )
 
+    # 5. RViz2：看 /scan 点云（可用 rviz:=false 关掉）
+    #    配置里的 Fixed Frame 是 odom —— TF 链 odom → base_link → laser_frame
+    #    分别由 DiffDrive 插件（经 /tf 桥接）和 robot_state_publisher 提供。
+    #    use_sim_time 必须开，否则 RViz 用墙上时钟，会和 /tf 的时间戳对不上，
+    #    表现是点云一闪一闪或者干脆不显示。
+    rviz = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        arguments=['-d', os.path.join(pkg_share, 'config', 'lidar_view.rviz')],
+        parameters=[{'use_sim_time': True}],
+        condition=IfCondition(context.launch_configurations.get('rviz', 'true')),
+        output='screen',
+    )
+
     actions = []
     # 软件渲染环境变量必须设在 gz_sim 启动之前
     if _running_in_wsl():
@@ -117,9 +134,15 @@ def _launch_setup(context, *args, **kwargs):
         # 明显慢于无传感器的世界，3s 时 create 常常拿不到 create 服务。
         TimerAction(period=10.0, actions=[spawn_robot]),
         bridge,
+        rviz,
     ])
     return actions
 
 
 def generate_launch_description():
-    return LaunchDescription([OpaqueFunction(function=_launch_setup)])
+    return LaunchDescription([
+        DeclareLaunchArgument(
+            'rviz', default_value='true',
+            description='是否随仿真启动 RViz2 查看 /scan 点云'),
+        OpaqueFunction(function=_launch_setup),
+    ])
