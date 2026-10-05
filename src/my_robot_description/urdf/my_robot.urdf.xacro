@@ -7,7 +7,14 @@
   <xacro:property name="base_height" value="0.15"/>
   <xacro:property name="wheel_radius" value="0.05"/>
   <xacro:property name="wheel_width"  value="0.03"/>
-  <xacro:property name="wheel_offset_x" value="0.0"/>
+  <!-- 驱动轮轴必须明显位于重心之后，否则驱动力矩的反作用会让机器人"翘头"。
+       原先 wheel_offset_x=0.0，重心几乎正压在轮轴上，翘头所需的力矩只有
+       m*g*x_com ≈ 6.3*9.8*0.005 ≈ 0.3 N·m，而巡航本身需要的力矩就有这个量级，
+       于是机器人一路以前轮轴为支点抬到后底盘棱触地（正好 7.236°，见
+       laser_joint 偏置与底盘尺寸），并且重心此时恰好落到轮轴正上方而保持不倒。
+       后果是激光雷达随之俯仰 7.24°，把地面扫了进来（360 束里有 164 束打到地面）。
+       把轮轴后移 0.08 m 后，恢复力矩升到约 5.2 N·m，翘头不再发生。 -->
+  <xacro:property name="wheel_offset_x" value="-0.08"/>
   <xacro:property name="wheel_offset_y" value="0.17"/>
   <xacro:property name="wheel_offset_z" value="-0.05"/>
   <xacro:property name="caster_radius" value="0.02"/>
