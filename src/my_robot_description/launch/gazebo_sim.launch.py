@@ -52,7 +52,16 @@ def _software_rendering_env():
 def _launch_setup(context, *args, **kwargs):
     pkg_share = get_package_share_directory('my_robot_description')
     urdf_file = os.path.join(pkg_share, 'urdf', 'my_robot.urdf.xacro')
-    world_file = os.path.join(pkg_share, 'worlds', 'empty.sdf')
+
+    # world 可切换：rooms.sdf（两间房+走廊，默认，用于 SLAM/Nav2）
+    #               empty.sdf（一面墙+一个盒子，用于雷达读数回归验证）
+    world_name = context.launch_configurations.get('world', 'rooms.sdf')
+    world_file = os.path.join(pkg_share, 'worlds', world_name)
+    if not os.path.isfile(world_file):
+        raise RuntimeError(
+            f'找不到 world 文件: {world_file}\n'
+            f'可用: {sorted(f for f in os.listdir(os.path.join(pkg_share, "worlds")) if f.endswith(".sdf"))}'
+        )
 
     robot_description = ParameterValue(Command(['xacro ', urdf_file]), value_type=str)
 
@@ -144,5 +153,9 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'rviz', default_value='true',
             description='是否随仿真启动 RViz2 查看 /scan 点云'),
+        DeclareLaunchArgument(
+            'world', default_value='rooms.sdf',
+            description='worlds/ 下的 world 文件名。rooms.sdf=两间房+走廊，'
+                        'empty.sdf=单面墙（雷达回归验证用）'),
         OpaqueFunction(function=_launch_setup),
     ])

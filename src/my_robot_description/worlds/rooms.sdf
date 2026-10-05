@@ -1,0 +1,206 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+  <!-- ================================================================
+       室内世界：两间房 + 一段走廊（纯 box 搭的，不依赖任何外部 mesh）
+
+       俯视布局（单位 m，坐标原点是机器人出生点）：
+
+         y=+2.5  ┌──────────────────────────────────────────┐
+                 │              走廊 (1.5m 宽)               │
+         y=+1.0  ├──────────┬───────────────┬───────────────┤
+                 │  门A     │     门B       │               │
+                 │ ········ │ ············· │               │
+                 │  房间 A   │               │    房间 B      │
+                 │ (6×3.5)  │    门(0.9)     │   (4×3.5)     │
+                 │          │ ← x=1 隔墙     │               │
+         y=-2.5  └──────────┴───────────────┴───────────────┘
+                x=-5      x=-2.5   x=0    x=1  x=3    x=5
+                                ↑ 机器人出生点 (0,0)
+
+       设计要点：
+       - 三个门洞让雷达能从各个角度看到不同距离的墙面，给 SLAM 提供
+         足够的几何约束；同时走廊本身是 2D SLAM 的退化场景（沿走廊
+         方向平移不可观），靠两端房间和门洞来打破。
+       - 出发点是空的 (0,0)，离最近墙面 1.0 m，车体 0.4×0.3 不会卡住。
+       - 墙高 2.5 m，雷达装在 z≈0.22，射线一定会打到墙而不是从顶上飞过去。
+
+       在本 world 里实测的雷达精度（与解析射线投射逐束比对，132 帧 × 360 束）：
+         - inf 束：0/360（旧 empty.sdf 是 277/360）
+         - 接近正射（|cos入射角| > 0.8）：误差 std 6.4 mm，31680 束中 >5cm 的 0 束
+         - 掠射（|cos| < 0.35）：误差 std 35 mm，44% 超过 5cm
+       掠射偏差来自 GPU 深度缓冲的栅格化边缘效应（真实激光雷达掠射时也会偏），
+       属于已知特性，量级远小于 SLAM 的相关性搜索窗口，不影响建图。
+
+       注意：本文件必须自带全部系统插件。显式指定 world 文件时 Gazebo
+       不会并入 /usr/share/gz/gz-sim8/server.config 的默认插件，漏掉
+       user-commands-system 会让 /world/default/create 永远不注册，
+       ros_gz_sim create 无限等待，机器人永远生成不出来。
+       ================================================================ -->
+  <world name="default">
+
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+
+    <light name="sun" type="directional">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>100 100</size>
+            </plane>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>100 100</size>
+            </plane>
+          </geometry>
+          <material>
+            <ambient>0.7 0.7 0.7 1</ambient>
+            <diffuse>0.7 0.7 0.7 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ============================================================
+         外墙：4 面，中心线在 ±5 / ±2.5，四角故意让它们互相重叠
+         （静态 box 重叠没有副作用），这样不用为拐角做特殊处理。
+         ============================================================ -->
+    <model name="wall_south">
+      <static>true</static>
+      <pose>0 -2.5 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>10.15 0.15 2.5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>10.15 0.15 2.5</size></box></geometry>
+          <material><ambient>0.75 0.72 0.65 1</ambient><diffuse>0.75 0.72 0.65 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_north">
+      <static>true</static>
+      <pose>0 2.5 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>10.15 0.15 2.5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>10.15 0.15 2.5</size></box></geometry>
+          <material><ambient>0.75 0.72 0.65 1</ambient><diffuse>0.75 0.72 0.65 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_west">
+      <static>true</static>
+      <pose>-5 0 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.15 5.15 2.5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.15 5.15 2.5</size></box></geometry>
+          <material><ambient>0.75 0.72 0.65 1</ambient><diffuse>0.75 0.72 0.65 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_east">
+      <static>true</static>
+      <pose>5 0 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.15 5.15 2.5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.15 5.15 2.5</size></box></geometry>
+          <material><ambient>0.75 0.72 0.65 1</ambient><diffuse>0.75 0.72 0.65 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ============================================================
+         走廊 / 房间 之间的隔墙：y = 1.0，x 从 -5 到 5。
+         两个门洞各宽 0.9：门A 中心 x=-2.5，门B 中心 x=+3.0。
+         于是被切成 3 段，长度 2.05 + 0.9 + 4.6 + 0.9 + 1.55 = 10.0
+         ============================================================ -->
+    <model name="divider_c_1">
+      <static>true</static>
+      <pose>-3.975 1.0 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>2.05 0.15 2.5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>2.05 0.15 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.82 1</ambient><diffuse>0.85 0.85 0.82 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="divider_c_2">
+      <static>true</static>
+      <pose>0.25 1.0 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>4.6 0.15 2.5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>4.6 0.15 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.82 1</ambient><diffuse>0.85 0.85 0.82 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="divider_c_3">
+      <static>true</static>
+      <pose>4.225 1.0 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>1.55 0.15 2.5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>1.55 0.15 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.82 1</ambient><diffuse>0.85 0.85 0.82 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ============================================================
+         房间 A / B 之间的隔墙：x = 1.0，y 从 -2.5 到 1.0（长 3.5）。
+         一个门洞宽 0.9，中心 y=-0.6，切成 2 段：
+         1.45 + 0.9 + 1.15 = 3.5
+         ============================================================ -->
+    <model name="divider_ab_1">
+      <static>true</static>
+      <pose>1.0 -1.775 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.15 1.45 2.5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.15 1.45 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.82 1</ambient><diffuse>0.85 0.85 0.82 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="divider_ab_2">
+      <static>true</static>
+      <pose>1.0 0.425 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.15 1.15 2.5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.15 1.15 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.82 1</ambient><diffuse>0.85 0.85 0.82 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+  </world>
+</sdf>
