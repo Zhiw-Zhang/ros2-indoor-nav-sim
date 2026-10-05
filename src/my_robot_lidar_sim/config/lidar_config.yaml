@@ -1,0 +1,71 @@
+# ============================================================
+# CPU 光线投射激光雷达 —— 配置
+#
+# 用途：在 WSL2 等无法使用 Gazebo GPU 渲染传感器传感器的环境下，
+#       提供与真实 2D 激光雷达等效的 /scan 数据（纯 CPU，无 OpenGL）。
+#
+# world.geometry 中的矩形必须与 worlds/empty.sdf 里的障碍物保持一致，
+# 修改 world 时请同步修改此处。
+# ============================================================
+
+lidar:
+  frame_id: laser_frame          # 雷达坐标系，需与 URDF 中 laser_frame 一致
+  topic: scan                    # 发布的 LaserScan 话题
+  update_rate: 10.0              # 发布频率 Hz
+  angle_min: -3.14159265358979   # 起始角 rad
+  angle_max: 3.14159265358979    # 终止角 rad
+  beam_count: 360                # 光束数（决定 angle_increment）
+  range_min: 0.1                 # 最小量程 m
+  range_max: 12.0                # 最大量程 m
+  # 高斯测距噪声标准差（m）。设为 0.0 可获得无噪声的理想数据。
+  noise_stddev: 0.01
+  # 固定随机种子，保证仿真可复现；null 表示每次运行随机
+  random_seed: 42
+
+  # ---- 雷达安装位置（相对 base_link 的静态 TF）----
+  # 必须与 URDF 中 laser_joint 的 origin 一致
+  mount_xyz: [0.0, 0.0, 0.12]
+  mount_rpy: [0.0, 0.0, 0.0]
+
+robot:
+  base_frame: base_link
+  odom_frame: odom
+  # ---- 位姿来源 ----
+  # 雷达必须知道自己的位姿才能投射光束。可选值:
+  #   ground_truth : 使用 Gazebo 真实位姿（推荐，无漂移）
+  #   odom         : 使用 /odom（轮式里程计，撞墙/打滑时会漂移）
+  #   auto         : 优先 ground_truth，取不到则回退 odom
+  #
+  # 注意: 必须用 ground_truth。实测差速驱动的 /odom 是轮子转速积分，
+  #       机器人撞墙被挡住后轮子仍在转，/odom 会持续增长（实测漂到 6.2 m，
+  #       而真实位置停在 2.69 m）。用 /odom 会让雷达从错误位置投射。
+  pose_source: ground_truth
+  # Gazebo 【原生】话题（不是 ROS 话题）。
+  # 节点直接起 `gz topic -e -t <该话题>` 读取真实位姿，
+  # 绕开 ros_gz_bridge 中不工作的 gz.msgs.Pose_V -> PoseArray 转换。
+  ground_truth_gz_topic: /world/default/pose/info
+  # PoseArray 中 base_link 的下标。
+  # gz.msgs.Pose_V 转成 ROS PoseArray 时会丢弃实体名，无法按名字索引。
+  #
+  #  -1 = 自动探测（推荐）：优先按实体名匹配，匹配不到则利用
+  #       "world 中静态实体不动、只有机器人会动" 的特性自动找下标。
+  #  >=0 = 手动指定。实测 world/empty.sdf 的顺序为:
+  #       0=ground_plane, 1=wall1, 2=box1, 3=my_robot, 4=base_link
+  #        可用 gz topic -e -t /world/default/pose/info 确认顺序。
+  base_link_index: -1
+  # 自动探测时优先匹配的实体名
+  base_link_name: "my_robot/base_link"
+
+world:
+  # 所有障碍物均为轴对齐矩形（axis-aligned box），单位 m。
+  # 每项: name, center=[x, y], size=[length_x, width_y]
+  # 这些值取自 worlds/empty.sdf，其中 box 是 3D 的，此处取其水平截面。
+  geometry:
+    - name: wall1
+      center: [3.0, 0.0]
+      size: [0.2, 4.0]
+      z: 0.5
+    - name: box1
+      center: [-2.0, 1.5]
+      size: [0.5, 0.5]
+      z: 0.25

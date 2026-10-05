@@ -1,0 +1,103 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+  <world name="default">
+    <!-- ============================================================
+         四个系统插件必须都在这里声明。显式指定 world 文件时，Gazebo 不会
+         再把 /usr/share/gz/gz-sim8/server.config 里的默认系统并进来。
+
+         最容易漏的是 UserCommands：/world/<名>/create 这个服务就是它提供的。
+         少了它，ros_gz_sim create 会永远卡在
+             Waiting for service [/world/default/create] to become available ...
+         既不报错也不超时 —— 机器人永远生成不出来，/scan 自然没有数据。
+
+         Sensors 驱动 URDF 里的 gpu_lidar，需要可用的 OGRE2 渲染上下文。
+         在 WSL2 上硬件 GL 路径（Mesa D3D12 后端）会让 Ogre2RenderEngine
+         初始化时段错误，因此 launch 在 WSL2 下强制软件渲染
+         （LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe），见
+         launch/gazebo_sim.launch.py。原生 Linux + 正常驱动下该回退不启用。
+         ============================================================ -->
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+
+    <light name="sun" type="directional">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>100 100</size>
+            </plane>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>100 100</size>
+            </plane>
+          </geometry>
+          <material>
+            <ambient>0.7 0.7 0.7 1</ambient>
+            <diffuse>0.7 0.7 0.7 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall1">
+      <static>true</static>
+      <pose>3 0 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>0.2 4 1</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>0.2 4 1</size></box>
+          </geometry>
+          <material>
+            <ambient>0.8 0.2 0.2 1</ambient>
+            <diffuse>0.8 0.2 0.2 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="box1">
+      <static>true</static>
+      <pose>-2 1.5 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>0.5 0.5 0.5</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>0.5 0.5 0.5</size></box>
+          </geometry>
+          <material>
+            <ambient>0.2 0.8 0.2 1</ambient>
+            <diffuse>0.2 0.8 0.2 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+  </world>
+</sdf>
