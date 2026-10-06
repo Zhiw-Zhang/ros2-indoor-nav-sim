@@ -157,10 +157,16 @@ controller_server:
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      # ★ 上游是 10.0 s / 0.5 m。这台车速度上限 0.5 m/s，但在 0.9 m 宽的
-      #   门口反复对位时平移量可能长时间接近 0；放宽到 15 s 避免误判"卡住"
-      #   而触发恢复行为。
-      required_movement_radius: 0.5
+      # ★ 上游是 0.5 m / 10.0 s，两个都改过，原因不同：
+      #   - 时间放宽到 15 s：这台车速度上限 0.5 m/s，在 0.9 m 宽的门口反复
+      #     对位时平移量可能长时间接近 0，10 s 太容易误判成"卡住"。
+      #   - 半径收到 0.2 m（原来是 0.5）：0.5 m 要求车在 15 s 内移动**超过
+      #     自身长度**（车长 0.40 m）才算有进展。实测车前 0.7 m 突然出现
+      #     障碍物时，collision_monitor 的 Approach 策略会把速度压到很低，
+      #     车一直在慢慢挪但永远攒不够 0.5 m，于是
+      #         Failed to make progress → 恢复行为 → 重试 → 再失败
+      #     死循环了 240 s 都没出来（见 docs/nav2.md 的障碍物验收）
+      required_movement_radius: 0.2
       movement_time_allowance: 15.0
 
     general_goal_checker:

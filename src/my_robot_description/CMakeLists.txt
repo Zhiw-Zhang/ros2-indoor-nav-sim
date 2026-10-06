@@ -15,6 +15,7 @@ install(
 # 用 install(PROGRAMS ...) 而不是 install(FILES ...)，前者会带上可执行位。
 install(PROGRAMS
   scripts/mapeval.py
+  scripts/obs_test.py
   scripts/nav_goals.py
   scripts/xwd2png.py
   DESTINATION lib/${PROJECT_NAME}
