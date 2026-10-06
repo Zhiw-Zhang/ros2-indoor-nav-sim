@@ -2,18 +2,55 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>my_robot_description</name>
-  <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <version>0.1.0</version>
+  <description>
+    四轮 skid-steer 小车的室内导航仿真：URDF 模型 + Gazebo 场景 + slam_toolbox 建图
+    + Nav2 自主导航。三条验收功能（起点到终点自主移动 / 障碍物避让 / 路径点导航）
+    的测试方法与实测数据见 docs/acceptance.md，文档入口见 docs/README.md。
+    当前所有参数为仿真占位值，实车标定见 docs/real_robot_params.md。
+  </description>
   <maintainer email="Zzw2600@outlook.com">zzw</maintainer>
-  <license>TODO: License declaration</license>
+  <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
-  <depend>xacro</depend>
-  <depend>robot_state_publisher</depend>
-  <depend>joint_state_publisher</depend>
-  <depend>rviz2</depend>
+  <!-- 机器人描述：launch 时用 Command(['xacro ...']) 展开，故为运行时依赖；
+       robot_state_publisher 发布 base_link -> laser_frame 的静态 TF -->
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>rviz2</exec_depend>
 
+  <!-- 仿真：Gazebo Sim（ros_gz_sim create）+ ros_gz 桥 -->
+  <exec_depend>ros_gz_sim</exec_depend>
+  <exec_depend>ros_gz_bridge</exec_depend>
+
+  <!-- 建图与导航 -->
+  <exec_depend>slam_toolbox</exec_depend>
+  <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>nav2_map_server</exec_depend>
+  <exec_depend>nav2_msgs</exec_depend>
+
+  <!-- 消息类型与基础库（scripts/ 下的 Python 工具使用） -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>tf2_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+
+  <!-- 第三方 Python：mapeval.py / cost_slice.py 用 numpy，mapeval.py / xwd2png.py 用 PIL -->
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-pil</exec_depend>
+
+  <!-- 文档里记录的工作流会用到的命令行工具：
+       slam.md 遥控建图用 teleop_twist_keyboard，
+       保存地图用 nav2_map_server 的 map_saver_cli（上面已列） -->
+  <exec_depend>teleop_twist_keyboard</exec_depend>
+
+  <!-- ⚠ 这两个 lint 依赖目前是**未启用**的：CMakeLists.txt 里没有
+       if(BUILD_TESTING) 段，所以 `colcon test` 是空转（实测 0 tests）。
+       要启用得往 CMakeLists.txt 加 ament_lint_auto 那段，但届时
+       ament_copyright / flake8 / pep257 会报一批问题（源文件都没有版权头、
+       脚本有超长行），需要单独清理一轮。在那之前保留这两行只是标记意图。 -->
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
 

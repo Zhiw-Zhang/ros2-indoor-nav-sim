@@ -41,9 +41,19 @@ sudo apt install ros-jazzy-nav2-bringup ros-jazzy-slam-toolbox \
   ros-jazzy-nav2-map-server ros-jazzy-xacro ros-jazzy-rviz2
 ```
 
-> ⚠️ `package.xml` 里的 `<depend>` 列表**还没登记上面这些**（目前只有
-> xacro / robot_state_publisher / joint_state_publisher / rviz2），所以
-> `rosdep install` **不会**自动装上它们。这是已知的待办，不是遗漏。
+> **也可以走 `rosdep`**，但本机的 rosdep **从未初始化**——
+> `/etc/ros/rosdep/sources.list.d/` 不存在，直接跑会报
+> `your rosdep installation has not been initialized yet`。要用它得先：
+>
+> ```bash
+> sudo rosdep init      # 需要 sudo
+> rosdep update         # 需要网络
+> rosdep install --from-paths src --ignore-src -r -y
+> ```
+>
+> `package.xml` 里的依赖已经登记齐了（1 条 buildtool + 17 条 `exec_depend` + 2 条
+> `test_depend`，含 `nav2_bringup`、`slam_toolbox`、`ros_gz_sim`、`ros_gz_bridge` 等），
+> 所以上面三条跑通后就能自动装齐。
 
 ---
 
