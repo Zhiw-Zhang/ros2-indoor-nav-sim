@@ -260,6 +260,88 @@ launch 中途抛异常时，**已经起来的容器不会跟着死**。残留的
 `update_min_a/d` 从 0.2/0.25 收到 0.15/0.15：这台车 0.5 m/s、1.5 rad/s，
 按上游阈值最坏情况下 0.5 s 才做一次滤波更新，期间全靠里程计外推。
 
+## 边建图边导航（`slam:=true`）
+
+```bash
+ros2 launch my_robot_description nav.launch.py slam:=true
+```
+
+`slam_toolbox` 顶替 AMCL + map_server，提供 `/map` 和 `map->odom`，Nav2 在
+"正在生长的地图"上规划和控制。此时 `map:=` 被忽略，SLAM 参数固定用
+`config/slam_toolbox.yaml`。
+
+用途：**换场地时不用"先建图、再导航"两步**。直接点目标，车一边走一边把地图
+建出来，走完存图即可。
+
+### 为什么不走 `nav2_bringup` 自带的 slam 分支
+
+`nav.launch.py` 传给 `nav2_bringup` 的是 `slam=False + use_localization=False`，
+slam_toolbox 由本文件自己 include（`slam_toolbox/launch/online_async_launch.py`）。
+
+原因在 `nav2_bringup/slam_launch.py`：
+
+```python
+has_slam_toolbox_params = HasNodeParams(params_file, 'slam_toolbox')
+... launch_arguments={'slam_params_file': params_file}
+    condition=IfCondition(has_slam_toolbox_params)
+```
+
+**只有当 `params_file` 里存在 `slam_toolbox:` 这一节时，它才会把参数传下去。**
+我们的 `config/nav2_params.yaml` 是纯 Nav2 参数、没有那一节，于是它会退回上游
+默认的 `mapper_params_online_sync.yaml`：
+
+| 上游默认值 | 后果 |
+|---|---|
+| `base_frame: base_footprint` | 我们没有这个 link → 拿不到雷达 TF → `/map`、`map->odom` **一个都不发** |
+| `check_min_dist_and_heading_precisely: false` | 原地旋转的扫描全部被丢弃（见 `slam.md`） |
+| `loop_search_maximum_distance: 3.0` | 假回环，地图上出现两份房间（见 `slam.md`） |
+
+失败表现极具迷惑性：Gazebo、Nav2、日志全部正常，**只有 RViz 里永远是一张空地图**，
+看起来像"SLAM + Nav2 这条路走不通"。
+
+自己 include 还有两个好处：用 `online_async`（后台线程处理扫描，边走边建图不容易
+丢帧，`slam.launch.py` 当初也是特意选的它）；启动顺序可控（SLAM 先起，Nav2 晚 8 s）。
+
+> ⚠️ 那个 8 s 的延迟是**预防性**的：`global_costmap.global_frame` 是 `map`，
+> 如果 activate 时 `map->odom` 还不存在，lifecycle_manager 会直接激活失败。
+> 但**没有**单独做过"不延迟会怎样"的对照实验，所以这一条是设计意图，不是实测结论。
+
+### 实测（`worlds/rooms.sdf`，4 个目标串起三个门）
+
+| # | 目标 (m) | 终点（SLAM 估计） | 到目标距离 | 结果 |
+|---|---|---|---|---|
+| 1 | (−2.5, 0.6) | (−2.578, 0.687) | 11.7 cm | SUCCEEDED |
+| 2 | (−2.5, 1.9) 穿门 A | (−2.366, 1.865) | 13.9 cm | SUCCEEDED |
+| 3 | (2.5, 1.9) 走廊东端 | (2.399, 1.885) | 10.2 cm | SUCCEEDED |
+| 4 | (3.0, 0.3) 穿门 B | (3.055, 0.215) | 10.1 cm | SUCCEEDED |
+
+**4/4 成功**，全部落在 `xy_goal_tolerance: 0.20` 内。所有节点（含
+`global_costmap`）lifecycle 一次激活成功，启动日志无 ERROR / WARN。
+
+走完存图后与解析几何逐格比对：
+
+| 指标 | 数值 |
+|---|---|
+| 尺寸 | 199 × 100 格 @ 0.05 m = 9.95 × 5.00 m |
+| 占用 / 空闲 / 未知 | 1549 (7.8%) / 17806 (89.5%) / 545 (2.7%) |
+| 占用格到最近真实墙面 均值 / 最大 | **1.03 / 5.90 cm** |
+| 占用格 ≤ 5 cm / ≤ 10 cm | 99.42% / **100%** |
+| 幻影墙（整块离墙 > 15 cm） | **0 块** |
+| 可见墙面覆盖率 | **86.02%** |
+| 三个门洞占用率 | 11.1% / 11.1% / 9.3%（同一方法量真实墙段是 43.3%） |
+| 相对 world 的整体偏移 | dx −1.0 / dy −3.0 cm |
+
+三张地图用**同一套脚本**量的对比（口径一致才可比）：
+
+| 地图 | 占用格到墙均值 | ≤ 5 cm 占比 | 幻影墙 | 墙面覆盖率 |
+|---|---|---|---|---|
+| 本节的 slam:=true（边导航边建） | **1.03 cm** | 99.42% | 0 | **86.02%** |
+| 手动遥控建的那张 | 1.12 cm | 99.95% | 0 | 87.05% |
+| `maps/rooms.yaml`（早期脚本自动建） | 1.50 cm | 85.70% | 0 | 78.13% |
+
+结论：**一边被 Nav2 拉着跑、一边建出来的地图，质量和不动的建图流程是一个量级**
+（占用格精度还比早期那张更好）。这条路可以放心用来换场地。
+
 ## 已知限制 / 下一步
 
 * **AMCL 是纯 2D 定位**，没有 IMU 融合。实车上如果轮式里程计更差，标准做法是上
@@ -267,6 +349,7 @@ launch 中途抛异常时，**已经起来的容器不会跟着死**。残留的
   EKF 的输出话题即可。
 * `alpha1 = 0.3` 是给"标定过、但仍会打滑"的 skid-steer 的值。如果上层发现转向跟不上，
   第一个该看的就是它。
-* 地图固定用 `maps/rooms.yaml`。换场地要重新建图（见 `slam.md`）后重跑一次。
+* 默认用固定地图 `maps/rooms.yaml`。换场地有两条路：先按 `slam.md` 重新建图再跑本
+  文件；或者直接用 `slam:=true` 边建图边导航（见上一节，实测 4/4 目标成功）。
 * 还没做的：多点巡航（`nav2_waypoint_follower`）、自动回充（`docking_server`
   已经在 lifecycle 里跑着但没配 dock）、`nav2_collision_monitor` 的减速/停车区。
