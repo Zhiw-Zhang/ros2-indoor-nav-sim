@@ -13,14 +13,15 @@
           雷达不俯仰，自然也不会扫到地面。
        2) 原地旋转的里程计误差：四轮平行，原地转时每个轮子都必须
           横向刮擦，编码器积分出来的转角必然与车体真实转角不符。
-          这是 skid-steer 的固有特性，实车同样存在，所以这里**保留**
-          而不是消除——让上层的 SLAM/Nav2 面对和实车一样的里程计质量。
+          这是 skid-steer 的固有特性，实车同样存在，所以物理上**保留**
+          这个刮擦（不去"修正"摩擦系数把它磨平）。
+          但**上报**的里程计要标定：见下面的 wheel_separation_scale。
 
        ★★ 下面这一段 property 是本工程**唯一**依赖实车实测数据的地方。
           全部是按 0.4×0.3 底盘估的占位值，不是实测值。
 
           拿到实车数据后怎么改：
-            1. 只改这一段（几何 / 质量 / 限速 / 摩擦 / 雷达，共 5 组）；
+            1. 只改这一段（几何 / 质量 / 限速 / 摩擦 / 打滑标定 / 雷达，共 6 组）；
             2. 不用 colcon build —— install 是符号链接，直接指向本文件；
             3. 重启 launch 即可生效。
 
@@ -45,6 +46,33 @@
        要和实车对比后再调——真实值只能靠实车标定。 -->
   <xacro:property name="wheel_mu_long" value="1.0"/>   <!-- 沿滚动方向 -->
   <xacro:property name="wheel_mu_lat"  value="0.5"/>   <!-- 垂直滚动方向 -->
+
+  <!-- ★★★ 有效轮距标定系数（skid-steer 最重要的一项标定）
+
+       问题：DiffDrive 插件用几何轮距 b=0.34 把角速度换算成左右轮速差
+             Δv = ω_b，再用同一个 b 反算里程计 ω_o = Δv/b。
+             但四轮侧滑让车体真实转角小于轮子"应该"转过的角度：
+                 ω_true = Δv / b_eff     其中 b_eff > b
+             于是 b_eff/b 这个倍率同时污染了**控制增益**和**里程计标度**：
+                 ω_o / ω_true = b_eff / b = 1.36
+                 ω_true / ω_cmd = b / b_eff = 0.73
+             即"命令转 1 圈，实际只转 0.73 圈，而里程计报 1 圈"。
+
+       解法：把插件里的 wheel_separation 换成 b_eff = b · 本系数。
+             指令侧 Δv = ω_cmd · b_eff →  ω_true = ω_cmd  ✅
+             里程计侧 ω_o = Δv / b_eff = ω_cmd = ω_true  ✅
+             一个系数同时修好两件事，且不需要动物理（刮擦照旧存在）。
+
+       1.36 的来源：本仓库实测（/tmp/step4/gains.py，原地转 ω=0.6/1.2/1.5
+       rad/s 三个工况），odom/真值 = 1.355 / 1.355 / 1.364 / 1.361。
+       数据与推导见 docs/nav2.md。
+
+       ⚠ 这个值必须用**实车**重测，方法是：原地以固定角速度转固定秒数，
+         比较"编码器积分出来的转角"和"实际转过的转角"（地上贴胶带/用
+         外部标定），比值填这里。仿真值与实车值不会一样。
+       ⚠ 转弯半径不同倍率也不同（侧滑量随曲率变化）。这里取原地转的值，
+         因为室内导航里原地转占绝大多数。弧线工况实测偏大约 5%，见 docs。 -->
+  <xacro:property name="wheel_separation_scale" value="1.36"/>
 
   <!-- ★ 速度/加速度上限：实车实测值待填。
        注意这些才是 gz-sim 8 真正认的参数；之前 URDF 里的
@@ -181,14 +209,17 @@
        一侧挂两个 joint 是官方支持的：文档明确写
        "can be attached to a model with any number of left and right wheels"，
        且 <left_joint>/<right_joint> "can appear multiple times"。
-       wheel_separation 仍然是左右轮距（0.34），与轴距无关。 -->
+
+       wheel_separation 用的是**有效轮距** 2*wheel_offset_y*scale，
+       不是几何轮距 2*wheel_offset_y —— 原因见上面
+       wheel_separation_scale 的长注释。0.34 * 1.36 = 0.4624 m。 -->
   <gazebo>
     <plugin filename="gz-sim-diff-drive-system" name="gz::sim::systems::DiffDrive">
       <left_joint>front_left_wheel_joint</left_joint>
       <left_joint>rear_left_wheel_joint</left_joint>
       <right_joint>front_right_wheel_joint</right_joint>
       <right_joint>rear_right_wheel_joint</right_joint>
-      <wheel_separation>${2 * wheel_offset_y}</wheel_separation>
+      <wheel_separation>${2 * wheel_offset_y * wheel_separation_scale}</wheel_separation>
       <wheel_radius>${wheel_radius}</wheel_radius>
       <odom_topic>odom</odom_topic>
       <tf_topic>tf</tf_topic>
