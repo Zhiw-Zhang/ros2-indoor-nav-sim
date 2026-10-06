@@ -299,12 +299,26 @@ has_slam_toolbox_params = HasNodeParams(params_file, 'slam_toolbox')
 失败表现极具迷惑性：Gazebo、Nav2、日志全部正常，**只有 RViz 里永远是一张空地图**，
 看起来像"SLAM + Nav2 这条路走不通"。
 
-自己 include 还有两个好处：用 `online_async`（后台线程处理扫描，边走边建图不容易
-丢帧，`slam.launch.py` 当初也是特意选的它）；启动顺序可控（SLAM 先起，Nav2 晚 8 s）。
+自己 include 还有好处：用 `online_async`（后台线程处理扫描，边走边建图不容易丢帧，
+`slam.launch.py` 当初也是特意选的它）。
 
-> ⚠️ 那个 8 s 的延迟是**预防性**的：`global_costmap.global_frame` 是 `map`，
-> 如果 activate 时 `map->odom` 还不存在，lifecycle_manager 会直接激活失败。
-> 但**没有**单独做过"不延迟会怎样"的对照实验，所以这一条是设计意图，不是实测结论。
+> **关于启动顺序**：一开始我以为要让 SLAM 先起、Nav2 晚一点起，否则
+> `global_costmap` 的 `global_frame: map` 在 activate 时找不到 TF 会激活失败。
+> 后来做了对照实验，**结论是不需要**。实测时间线（`sim:=false slam:=true`）：
+>
+> ```
+> 882.11  slam_toolbox 进程启动
+> 882.40  slam_toolbox activating
+> 883.10  Nav2 组件容器启动
+> 883.39 ~ 883.65  各节点 load 完
+> ~893    global_costmap 才 activate
+> ```
+>
+> `slam_toolbox` 是普通节点、起来就能处理扫描；而 Nav2 是组件容器 + 逐个
+> lifecycle 转换，**光激活就要约 10 秒**，天然落后十几秒。把延迟硬去掉重跑，
+> `global_costmap` 依然一次激活成功，日志里一条 `Timed out waiting for transform`
+> 都没有，两个穿门目标也都 SUCCEEDED。所以 `nav.launch.py` 里**没有**这个延迟
+> （只有 `sim:=true` 时那个等机器人 spawn 的 15 s）。
 
 ### 实测（`worlds/rooms.sdf`，4 个目标串起三个门）
 

@@ -80,9 +80,13 @@
    config/slam_toolbox.yaml 一份真源），并给 nav2_bringup 传
    slam=False + use_localization=False，让它只起 navigation_launch.py。
    额外收益：用 online_async（后台线程处理扫描）而不是上游的 online_sync，
-   车一边走一边建图时不容易丢帧；启动顺序也能自己控——**SLAM 必须先于
-   Nav2**，否则 global_costmap 的 global_frame=map 在 activate 时找不到
-   TF，lifecycle_manager 会直接激活失败。
+   车一边走一边建图时不容易丢帧。
+
+   顺带澄清一个我原先以为要防、实测后确认**不需要**防的问题：slam_toolbox 与
+   Nav2 之间不需要人为错开启动。slam_toolbox 是普通节点、起来就能处理扫描，
+   而 Nav2 是组件容器 + 逐个 lifecycle 转换，光激活就要约 10 s，天然落后十几秒。
+   实测把延迟去掉（sim:=false slam:=true）后 global_costmap 依然一次激活成功，
+   无任何 TF 超时告警，穿门目标正常。细节记在下面 nav2_delay 的注释里。
 """
 import os
 
@@ -227,15 +231,26 @@ def _launch_setup(context, *args, **kwargs):
         )
 
     # Nav2 什么时候起：
-    #   sim:=true           → 15 s。见"坑 2"：机器人大约 10 s 才 spawn 出来，
-    #                          AMCL 激活时要用 set_initial_pose 算 map->odom，
-    #                          那一刻 odom->base_link 必须已经存在。
-    #   sim:=false + slam   → 8 s。Gazebo 早就跑着了，但要等 slam_toolbox
-    #                          收到扫描并发出 map->odom，否则 global_costmap
-    #                          的 global_frame=map 在 activate 时找不到 TF，
-    #                          lifecycle_manager 会直接激活失败。
-    #   sim:=false 且不 slam→ 0.5 s（等于立即，只是等一个 launch 事件循环）。
-    nav2_delay = 15.0 if sim_on else (8.0 if slam_on else 0.5)
+    #   sim:=true  → 15 s。见"坑 2"：机器人大约 10 s 才 spawn 出来，
+    #                AMCL 激活时要用 set_initial_pose 算 map->odom，
+    #                那一刻 odom->base_link 必须已经存在。
+    #   sim:=false → 0.5 s（等于立即，只是等一个 launch 事件循环）。
+    #                Gazebo 早就跑着了，扫描也早在流。
+    #
+    # ★ slam:=true 时**不需要**额外延迟。这一点专门做过对照实验（下面记的是
+    #   实测时间线，不是推测）：
+    #       882.11  slam_toolbox 进程启动
+    #       882.40  slam_toolbox activating
+    #       883.10  Nav2 组件容器启动
+    #       883.39  ~ 883.65  各节点 load 完
+    #       ~893    global_costmap 才 activate
+    #   原因是 slam_toolbox 是普通节点、起来就能处理扫描；而 Nav2 是组件容器 +
+    #   逐个 lifecycle configure/activate，光这一步就要约 10 s。slam_toolbox
+    #   天然领先十几秒，map->odom 早就发出来了。
+    #   把这里的延迟硬写成 0.5 s 重跑（sim:=false slam:=true），global_costmap
+    #   依然一次激活成功，日志里连一条 "Timed out waiting for transform" 都没有，
+    #   两个穿门目标也都 SUCCEEDED。所以不加这个延迟——白等 8 秒没有意义。
+    nav2_delay = 15.0 if sim_on else 0.5
     actions.append(TimerAction(period=nav2_delay, actions=[nav2_include()]))
 
     # ---- 4. RViz（地图 + 代价地图 + 路径 + 粒子云 + Nav2 面板）----
