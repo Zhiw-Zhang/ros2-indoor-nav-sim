@@ -9,6 +9,10 @@ colcon build --symlink-install --packages-select my_robot_description
 source install/setup.bash
 ```
 
+> ⚠ **这五个脚本里有三个是仿真专用的**（`mapeval.py` 和 `obs_test.py --static`
+> 都要拿 world SDF 当真值，`xwd2png.py` 截 Gazebo GUI）。搬到真车后它们的替代方案
+> 见 [`real_robot_plan.md` 第 4 节](real_robot_plan.md)。
+
 ---
 
 ## `mapeval.py` —— 建图质量验收

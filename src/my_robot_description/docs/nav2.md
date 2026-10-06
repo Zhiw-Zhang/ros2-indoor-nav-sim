@@ -137,21 +137,12 @@ ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose \
 
 `cmd_vel` 下固定角速度转一段固定时间，用 Gazebo 真值位姿累加**未缠绕**的转角增量
 （不能取末减初，±180° 有歧义），并且按**仿真时间**计（实时率不是 1.0）。
-原地转的四个工况：
 
-| 工况 | `odom/真值` 标定前 | 标定后 |
-|---|---|---|
-| ω = +0.6 rad/s | 1.355 | **1.040** |
-| ω = −0.6 rad/s | 1.355 | **1.000** |
-| ω = +1.2 rad/s | 1.364 | **1.003** |
-| ω = +1.5 rad/s | 1.361 | — |
+倍率很稳（1.355~1.364），所以取 **1.36**。标定后 `odom/真值` 落到 1.00~1.04。
 
-倍率很稳（1.355~1.364），所以取 **1.36**。
-
-> 弧线工况（v=0.3、ω=+0.5、转弯半径 0.6 m）标定后还差 9%（odom/真值 1.091）。
-> 这是真的：侧滑量随曲率变化，转弯半径越大、原地转成分越少，等效轮距越大。
-> 单一标量只能折中。这里**优先照顾原地转**，因为室内导航（穿门、对准）以原地转为主。
-> 弧线那一档的残余偏差是 9% 而不是 36%，已经不影响 AMCL 了。
+> **完整的五个工况数据表（含弧线工况）不在这里，见
+> [`real_robot_params.md` 第二节](real_robot_params.md)。** 那里也是实车标定步骤的正式出处，
+> 本节只讲"为什么需要这个系数"。
 
 ### 解法
 
@@ -171,8 +162,8 @@ ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose \
 <xacro:property name="wheel_separation_scale" value="1.36"/>
 ```
 
-**⚠ 1.36 是仿真值，实车必须重测。** 方法：原地以固定角速度转固定秒数，
-比较"编码器积分出来的转角"和"车上/地上实际转过的转角"（贴胶带或外部标定），比值填进去。
+**⚠ 1.36 是仿真值，实车必须重测。** 步骤见
+[`real_robot_params.md` 第二节](real_robot_params.md)。
 
 ## 配置里几处必须跟着实车改的地方
 
@@ -418,27 +409,28 @@ has_slam_toolbox_params = HasNodeParams(params_file, 'slam_toolbox')
 `inflation_radius` 降到 0.25 左右，代价是贴墙走的余量变小 —— 这个取舍要拿
 实车试，模拟里试不出结论。
 
-## 障碍物避让：实测发现的问题
+## 障碍物避让：结论摘要（完整数据见 `acceptance.md`）
 
-`docs/acceptance.md` 里有完整的验收表和复现命令。结论摘要：
+`docs/acceptance.md` 里有完整的验收表、根因分析和复现命令。这里只留结论：
 
 * **静态未知障碍物**（地图上没有、雷达现场看到）能干净绕开：实测 T1 绕行 70.3 cm、
   最小间距 33.5 cm；5 cm 细杆也能被标进代价图并绕开（间距 39.2 cm）。✅
 * **车前 0.7 m 突然出现障碍物**会卡死：`collision_monitor` 能在 0.05 s 内刹停
   （安全兜底有效），但车随后陷进恢复行为死循环，150 s 出不来。❌
 
-原因：`collision_monitor` 用的是 `approach`（调节接近速度，不保证不接触），
-车会一直挪到 footprint 压进障碍物的内切膨胀区；此时 MPPI 找不到无碰撞轨迹，
-而 `spin` / `backup` 这些恢复行为自己也要做碰撞检查、当前状态已"在碰撞中"，
-于是全部失败并无限重试。
+原因一句话：`collision_monitor` 用的是 `approach`（调节接近速度，不保证不接触），
+车会一直挪到 footprint 压进障碍物的内切膨胀区；此后 MPPI 和 `spin` / `backup`
+这些**恢复行为自己也要做碰撞检查**，于是一起失败并无限重试。
+（四步完整推导见 `acceptance.md` 的"T2：没通过，以及为什么"。）
 
-为此把 `progress_checker.required_movement_radius` 从 `0.5` 收到 `0.2`
-（0.5 m 要求一台车长 0.40 m 的车移动超过自身长度才算有进展，不合理）。
-实测最小间距从 19.9 cm 改善到 29.3 cm，**但没有解开死锁**——瓶颈不在阈值。
-彻底的修法（换 `stop` 策略或调 `time_before_collision`）会影响所有导航行为，
-尚未验证，见 `docs/acceptance.md` 的"已知残余风险"。
+已试着修过一处——`progress_checker.required_movement_radius` 0.5 → 0.2，
+最小间距从 19.9 cm 改善到 29.3 cm，但**没有解开死锁**，瓶颈不在阈值。
+彻底的修法（换 `stop` 策略或调 `time_before_collision`）会影响所有导航行为，尚未验证。
 
-## 已知限制 / 下一步
+## 已知限制 / 下一步（仿真侧）
+
+> 这一节讲**仿真配置本身**的限制。**搬到真车要做什么**是另一件事，
+> 见 [`real_robot_plan.md`](real_robot_plan.md)。
 
 * **AMCL 是纯 2D 定位**，没有 IMU 融合。实车上如果轮式里程计更差，标准做法是上
   `robot_localization`（EKF：轮速 + IMU）再喂给 Nav2，那时本文件里的 `odom` 换成
@@ -464,3 +456,5 @@ has_slam_toolbox_params = HasNodeParams(params_file, 'slam_toolbox')
   `nav2_collision_monitor` 的减速/停车区（现在是单个 `FootprintApproach` polygon）。
 * **`inflation_radius` 要按实车场地重新定**：0.35 这个值配 0.4 m 宽的车，
   通道宽度得 ≥ 1.0 m 才走得舒服，见本节"能过 ≠ 好过"。
+  真机重定的时机和依赖关系（必须先量完轮距/定位误差）见
+  [`real_robot_plan.md` 第 3 节](real_robot_plan.md)。
