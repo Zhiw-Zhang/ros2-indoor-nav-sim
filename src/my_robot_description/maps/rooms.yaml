@@ -1,0 +1,15 @@
+# rooms.sdf（两间房 + 一段走廊）的栅格地图，由 slam_toolbox 建图后
+# 用 `ros2 run nav2_map_server map_saver_cli` 保存而来。
+#
+# 重新生成的办法见 docs/slam.md（跑 slam.launch.py → 遥控走一圈 → map_saver_cli）。
+#
+# 尺寸核对：199 x 100 格 x 0.05 m = 9.95 x 5.0 m，与 rooms.sdf 的
+# 10 x 5 m 房间范围一致（world 布局见 rooms.sdf 头部注释）。
+# 占用格与真实墙面的一致性检查结果见 docs/nav2.md。
+image: rooms.pgm
+mode: trinary
+resolution: 0.05
+origin: [-4.98, -2.485, 0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196

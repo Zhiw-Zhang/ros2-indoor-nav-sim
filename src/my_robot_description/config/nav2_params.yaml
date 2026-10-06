@@ -1,0 +1,564 @@
+# ============================================================================
+# Nav2 参数（ROS 2 Jazzy / nav2_bringup）
+# ============================================================================
+# 这份文件是 `nav2_bringup/params/nav2_params.yaml`（上游默认）的**派生版**，
+# 只改动与"我们这台具体机器人"有关的项。改过的地方都以 `★` 标注，并写明原因。
+#
+# 上游默认值面向的是 TurtleBot3（半径 0.22 m 的圆形底盘、轮距 0.16 m、
+# 速度上限 0.26 m/s）。我们这台是 0.40 x 0.37 m 的四轮 skid-steer，
+# 速度上限 0.5 m/s，两者差得很远，直接照抄默认值会出问题。
+#
+# 所有 ★ 里的数字都来自 urdf/my_robot.urdf.xacro 顶部的 property 块。
+# 那里是"实车实测值"的唯一登记处；这里改了别忘了同步（对照表见
+# docs/real_robot_params.md）。
+#
+# 与 xacro property 的对应关系（推导过程见 docs/nav2.md）：
+#   base_length 0.40, base_width 0.30, wheel_offset_y 0.17, wheel_width 0.03
+#       -> footprint 前后 ±0.20, 左右 ±0.185（±0.185 是轮子外沿，比车体宽）
+#   max_linear_vel  0.5   -> vx_max / velocity_smoother.max_velocity[0]
+#   max_angular_vel 1.5   -> wz_max / velocity_smoother.max_velocity[2]
+#   max_linear_acc  0.5   -> ax_max / max_accel[0]
+#   max_angular_acc 2.0   -> az_max / max_accel[2]
+#   lidar_range_min 0.1 / lidar_range_max 12.0 -> amcl.laser_min/max_range
+#
+# 启动方式：launch/nav.launch.py（它会把 map 路径一起传进来）。
+# ============================================================================
+
+amcl:
+  ros__parameters:
+    use_sim_time: True
+
+    # ★ 我们没有 base_footprint 这个 link —— TF 树是 map -> odom -> base_link
+    #   -> laser_frame。用上游默认的 base_footprint 会让 AMCL 一直等一个
+    #   永远不存在的 TF，然后静默地不发 map->odom。
+    base_frame_id: "base_link"
+    odom_frame_id: "odom"
+    global_frame_id: "map"
+    scan_topic: scan
+    robot_model_type: "nav2_amcl::DifferentialMotionModel"
+
+    # ★ 开机即给初值（车就 spawn 在 world (0,0)，而地图坐标系与 world 重合，
+    #   见 maps/rooms.yaml 的 origin）。不设的话必须手动在 RViz 里点
+    #   "2D Pose Estimate"，否则 AMCL 不输出 map->odom，Nav2 直接不能用。
+    #   真机上初始化位姿本来就是已知的（从充电桩/原点出发），所以这不算作弊。
+    set_initial_pose: true
+    always_reset_initial_pose: false
+    first_map_only: false
+    initial_pose:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0
+
+    # ★ 里程计噪声。上游默认四个 alpha 都是 0.2。
+    #   这台车是 skid-steer，原地转时轮子横向刮擦。xacro 里的
+    #   wheel_separation_scale 已经把里程计的**系统性**标度误差标定掉了
+    #   （odom/真值 从 1.36 降到 1.00~1.04，数据见 docs/nav2.md），
+    #   剩下的只有打滑带来的随机波动和转弯半径不同引起的残余偏差，
+    #   所以 alpha1 只需要比上游默认稍微大一点。
+    #   如果哪天上层发现定位跟不上转向，第一个该看的就是这里。
+    alpha1: 0.3
+    alpha2: 0.2
+    alpha3: 0.2
+    alpha4: 0.2
+    alpha5: 0.2
+
+    # ★ 雷达量程跟 xacro 的 lidar_range_min/max 对齐。
+    #   上游是 100.0 / -1.0（"用扫描自己报的量程"），我们显式写死更安全：
+    #   仿真里 gpu_lidar 打到墙外会报 inf，显式上限能让 AMCL 正确地把
+    #   超量程束当成"没有信息"而不是"那里有障碍"。
+    laser_min_range: 0.1
+    laser_max_range: 12.0
+    laser_model_type: "likelihood_field"
+    # ★ 似然场只在 1 m 内算"到最近障碍的距离"。上游 2.0 是给地图不太准的
+    #   场合的；我们的雷达和地图都准，放小一点能让似然面更陡，定位更紧。
+    laser_likelihood_max_dist: 1.0
+    # ★ 上游 60（每 6 束取一束）。我们雷达有 360 束，取 1/3 也不贵，
+    #   束数越多似然越平滑、抖动越小。
+    max_beams: 120
+
+    # ★ 观测模型权重。这两个数决定了似然面有多"尖"：
+    #   z_hit  = 命中真实障碍的权重（信息）
+    #   z_rand = 随机噪声权重（不携带信息，把似然面抹平）
+    #   上游 0.5/0.5 意味着一半的观测被当成噪声，似然面非常平，
+    #   粒子云收不紧 —— 实测定位抖动 ±8 cm 主要就来自这里。
+    #   我们的雷达噪声只有 1 cm、地图 100% 落在真实墙面 15 cm 内，
+    #   所以敢给 0.8/0.2。
+    z_hit: 0.8
+    z_rand: 0.2
+    z_max: 0.05
+    z_short: 0.05
+    lambda_short: 0.1
+
+    # ★ sigma_hit = 单束测距误差的标准差。上游 0.2 m 对 5 cm 分辨率的地图
+    #   来说太宽了：偏 10 cm 的粒子只被罚掉 12% 的似然，等于没罚。
+    #   我们实测雷达正射误差 6.4 mm、地图栅格 5 cm，0.1 m 更合适，
+    #   同时也容得下地图栅格量化和掠射时的几厘米误差。
+    sigma_hit: 0.1
+    do_beamskip: false
+    beam_skip_distance: 0.5
+    beam_skip_threshold: 0.3
+    beam_skip_error_threshold: 0.9
+
+    # ★ 粒子数。上游 500~2000。地图很小、雷达很准，多放一点粒子
+    #   不贵（AMCL 单核占用本来就低），换来更稳的收敛。
+    min_particles: 800
+    max_particles: 3000
+    pf_err: 0.05
+    pf_z: 0.99
+    resample_interval: 1
+    # ★ 上游 0.2 rad / 0.25 m。这台车 0.5 m/s、1.5 rad/s，按上游阈值最坏
+    #   情况下 0.5 s 才做一次滤波更新，期间全靠里程计外推。收紧到
+    #   0.15 让更新更勤（代价是 CPU，实测可忽略）。
+    update_min_a: 0.15
+    update_min_d: 0.15
+    save_pose_rate: 0.5
+    recovery_alpha_slow: 0.0
+    recovery_alpha_fast: 0.0
+
+    # map->odom 变换往前外推 1.0 s。仿真里 /clock 与 /scan 到达常有抖动，
+    # 给大一点可以让 RViz / 控制器查 TF 时不至于"还没有这个时刻的数据"。
+    transform_tolerance: 1.0
+    tf_broadcast: true
+
+bt_navigator:
+  ros__parameters:
+    use_sim_time: True
+    global_frame: map
+    robot_base_frame: base_link
+    odom_topic: /odom
+    bt_loop_duration: 10
+    default_server_timeout: 20
+    wait_for_service_timeout: 1000
+    action_server_result_timeout: 900.0
+    navigators: ["navigate_to_pose", "navigate_through_poses"]
+    navigate_to_pose:
+      plugin: "nav2_bt_navigator::NavigateToPoseNavigator"
+    navigate_through_poses:
+      plugin: "nav2_bt_navigator::NavigateThroughPosesNavigator"
+    error_code_names:
+      - compute_path_error_code
+      - follow_path_error_code
+
+controller_server:
+  ros__parameters:
+    use_sim_time: True
+    controller_frequency: 20.0
+    costmap_update_timeout: 0.30
+    min_x_velocity_threshold: 0.001
+    # 上游默认。我们不做横向运动，这个阈值只是把 vy 视作 0 的判据。
+    min_y_velocity_threshold: 0.5
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    progress_checker_plugins: ["progress_checker"]
+    goal_checker_plugins: ["general_goal_checker"]
+    controller_plugins: ["FollowPath"]
+    use_realtime_priority: false
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      # ★ 上游是 10.0 s / 0.5 m。这台车速度上限 0.5 m/s，但在 0.9 m 宽的
+      #   门口反复对位时平移量可能长时间接近 0；放宽到 15 s 避免误判"卡住"
+      #   而触发恢复行为。
+      required_movement_radius: 0.5
+      movement_time_allowance: 15.0
+
+    general_goal_checker:
+      stateful: True
+      plugin: "nav2_controller::SimpleGoalChecker"
+      # ★ 上游是 0.25/0.25。收紧到 0.20 —— 车只有 0.40 m 长，0.25 m 的
+      #   位置误差已经很显眼了。再紧（<0.15）会让控制器在终点反复微调。
+      xy_goal_tolerance: 0.20
+      yaw_goal_tolerance: 0.20
+
+    # ---- MPPI 控制器 ----
+    # 上游默认就是 MPPI（Jazzy）。这里把加速度/速度约束改成这台车的真实值，
+    # 否则 MPPI 会规划出物理上做不到的轨迹（上游 ax_max=3.0 是我们的 6 倍）。
+    FollowPath:
+      plugin: "nav2_mppi_controller::MPPIController"
+      time_steps: 56
+      model_dt: 0.05
+      # ★ 上游 2000 个采样。WSL2 上 CPU 有限（且 Gazebo 本身在吃一个核），
+      #   降到 1200 换取 20 Hz 的稳定控制频率。精度损失很小。
+      batch_size: 1200
+      # ★ 对齐 xacro 的 max_linear_acc / max_angular_acc
+      ax_max: 0.5
+      ax_min: -0.5
+      ay_max: 3.0
+      ay_min: -3.0
+      az_max: 2.0
+      vx_std: 0.2
+      vy_std: 0.2
+      wz_std: 0.4
+      # ★ 对齐 max_linear_vel / max_angular_vel
+      vx_max: 0.5
+      vx_min: -0.3
+      vy_max: 0.5
+      wz_max: 1.5
+      iteration_count: 1
+      prune_distance: 1.7
+      transform_tolerance: 0.1
+      temperature: 0.3
+      gamma: 0.015
+      motion_model: "DiffDrive"
+      visualize: true
+      regenerate_noises: true
+      TrajectoryVisualizer:
+        trajectory_step: 5
+        time_step: 3
+      AckermannConstraints:
+        min_turning_r: 0.2
+      critics: [
+        "ConstraintCritic", "CostCritic", "GoalCritic",
+        "GoalAngleCritic", "PathAlignCritic", "PathFollowCritic",
+        "PathAngleCritic", "PreferForwardCritic"]
+      ConstraintCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+      GoalCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 1.4
+      GoalAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.0
+        threshold_to_consider: 0.5
+      PreferForwardCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 0.5
+      CostCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.81
+        near_collision_cost: 253
+        critical_cost: 300.0
+        # ★ 上游是 false（按外接圆近似）。我们车体是明显的长方形
+        #   （0.40 x 0.37），按 footprint 精确判定能让 MPPI 在 0.9 m 门口
+        #   敢于贴边通过。开了以后 CostCritic 慢一些，但 batch_size 降过。
+        consider_footprint: true
+        collision_cost: 1000000.0
+        near_goal_distance: 1.0
+        trajectory_point_step: 2
+      PathAlignCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 14.0
+        max_path_occupancy_ratio: 0.05
+        trajectory_point_step: 4
+        threshold_to_consider: 0.5
+        offset_from_furthest: 20
+        use_path_orientations: false
+      PathFollowCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        offset_from_furthest: 5
+        threshold_to_consider: 1.4
+      PathAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 2.0
+        offset_from_furthest: 4
+        threshold_to_consider: 0.5
+        max_angle_to_furthest: 1.0
+        mode: 0
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: True
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      global_frame: odom
+      robot_base_frame: base_link
+      rolling_window: true
+      width: 3
+      height: 3
+      resolution: 0.05
+      # ★ 用多边形代替上游的 robot_radius: 0.22。
+      #   车体外沿 x ∈ [-0.20, 0.20]（base_length 0.40），
+      #   y ∈ [-0.185, 0.185]（wheel_offset_y 0.17 + wheel_width/2 0.015，
+      #   轮子比车体半宽 0.15 还宽 3.5 cm，不能只按车体算！）
+      #   注意上游的 0.22 圆半径比我们的外接圆 0.273 还小，直接用会漏碰。
+      footprint: "[[-0.20, -0.185], [0.20, -0.185], [0.20, 0.185], [-0.20, 0.185]]"
+
+      # ★ 上游局部层用 voxel_layer。我们只有一台固定高度的 2D 雷达，
+      #   体素层是纯浪费（还多发布一张 3D 体素云）。换成 2D obstacle_layer。
+      plugins: ["obstacle_layer", "inflation_layer"]
+
+      # ★ 上游 inflation_radius 0.70 / cost_scaling_factor 3.0 是给
+      #   TurtleBot 在室内用的。我们的门只有 0.9 m 宽，0.70 的膨胀会让
+      #   门口整段变成高代价区。0.35 = 外接圆半径 0.273 + 约 8 cm 余量。
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.35
+
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          # ★ 雷达量程 12 m，但局部窗口只有 3x3 m，超过 1.5 m 之外的点对
+          #   局部避障没有意义。上游 3.0/2.5 也可以，这里按窗口大小收紧。
+          raytrace_max_range: 5.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 4.0
+          obstacle_min_range: 0.0
+      always_send_full_costmap: True
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: True
+      update_frequency: 1.0
+      publish_frequency: 1.0
+      global_frame: map
+      robot_base_frame: base_link
+      # ★ 同上
+      footprint: "[[-0.20, -0.185], [0.20, -0.185], [0.20, 0.185], [-0.20, 0.185]]"
+      # ★ 与 maps/rooms.yaml 的 resolution 保持一致（0.05）。
+      #   不一致时 static_layer 会重采样，地图会变糊。
+      resolution: 0.05
+      track_unknown_space: true
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 5.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 4.0
+          obstacle_min_range: 0.0
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: True
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.35
+      always_send_full_costmap: True
+
+map_server:
+  ros__parameters:
+    use_sim_time: True
+    # yaml_filename 由 nav.launch.py 通过 launch 参数注入，不写在这里
+    # （写在这里会和 launch 参数打架）。
+
+map_saver:
+  ros__parameters:
+    use_sim_time: True
+    save_map_timeout: 5.0
+    free_thresh_default: 0.25
+    occupied_thresh_default: 0.65
+    map_subscribe_transient_local: True
+
+planner_server:
+  ros__parameters:
+    use_sim_time: True
+    # ★ 上游 20.0。地图只有 10x5 m（200x100 格），NavFn 一次规划 <1 ms，
+    #   没必要 20 Hz。降到 5 Hz 省 CPU。
+    expected_planner_frequency: 5.0
+    planner_plugins: ["GridBased"]
+    costmap_update_timeout: 1.0
+    GridBased:
+      plugin: "nav2_navfn_planner::NavfnPlanner"
+      # ★ 上游 0.5。0.25 让"目标点落在墙里/代价高区域时"更容易就近改点，
+      #   同时不会像 0.5 那样把目标悄悄挪很远。
+      tolerance: 0.25
+      # ★ A* 比 Dijkstra 快，路径一样最优。地图小，差别不大，选快的。
+      use_astar: true
+      # 地图上没被雷达扫到的格子是"未知"。允许穿过未知区域，
+      # 否则机器人只在建图时走过的走廊里能走。
+      allow_unknown: true
+
+smoother_server:
+  ros__parameters:
+    use_sim_time: True
+    smoother_plugins: ["simple_smoother"]
+    simple_smoother:
+      plugin: "nav2_smoother::SimpleSmoother"
+      tolerance: 1.0e-10
+      max_its: 1000
+      do_refinement: True
+
+behavior_server:
+  ros__parameters:
+    use_sim_time: True
+    local_costmap_topic: local_costmap/costmap_raw
+    global_costmap_topic: global_costmap/costmap_raw
+    local_footprint_topic: local_costmap/published_footprint
+    global_footprint_topic: global_costmap/published_footprint
+    cycle_frequency: 10.0
+    behavior_plugins: ["spin", "backup", "drive_on_heading", "assisted_teleop", "wait"]
+    spin:
+      plugin: "nav2_behaviors::Spin"
+    backup:
+      plugin: "nav2_behaviors::BackUp"
+    drive_on_heading:
+      plugin: "nav2_behaviors::DriveOnHeading"
+    wait:
+      plugin: "nav2_behaviors::Wait"
+    assisted_teleop:
+      plugin: "nav2_behaviors::AssistedTeleop"
+    local_frame: odom
+    global_frame: map
+    robot_base_frame: base_link
+    transform_tolerance: 0.1
+    simulate_ahead_time: 2.0
+    # ★ 对齐 max_angular_vel 1.5 / max_angular_acc 2.0
+    max_rotational_vel: 1.0
+    min_rotational_vel: 0.4
+    rotational_acc_lim: 2.0
+
+waypoint_follower:
+  ros__parameters:
+    use_sim_time: True
+    loop_rate: 20
+    stop_on_failure: false
+    action_server_result_timeout: 900.0
+    waypoint_task_executor_plugin: "wait_at_waypoint"
+    wait_at_waypoint:
+      plugin: "nav2_waypoint_follower::WaitAtWaypoint"
+      enabled: True
+      waypoint_pause_duration: 200
+
+# route_server 在 Jazzy 的 navigation_launch.py 的 lifecycle 列表里，
+# 不配它 lifecycle_manager 会报"节点不存在"。
+route_server:
+  ros__parameters:
+    use_sim_time: True
+    boundary_radius_to_achieve_node: 1.0
+    radius_to_achieve_node: 2.0
+    smooth_corners: true
+    operations: ["AdjustSpeedLimit", "ReroutingService", "CollisionMonitor"]
+    ReroutingService:
+      plugin: "nav2_route::ReroutingService"
+    AdjustSpeedLimit:
+      plugin: "nav2_route::AdjustSpeedLimit"
+    CollisionMonitor:
+      plugin: "nav2_route::CollisionMonitor"
+      max_collision_dist: 3.0
+    edge_cost_functions: ["DistanceScorer", "CostmapScorer"]
+    DistanceScorer:
+      plugin: "nav2_route::DistanceScorer"
+    CostmapScorer:
+      plugin: "nav2_route::CostmapScorer"
+
+# cmd_vel 链路（Jazzy 的 navigation_launch.py 已经 remap 好了）：
+#   controller_server -> cmd_vel_nav -> velocity_smoother
+#                     -> cmd_vel_smoothed -> collision_monitor -> /cmd_vel
+# 也就是说 collision_monitor 是最后一道闸，它不转起来车就不动。
+velocity_smoother:
+  ros__parameters:
+    use_sim_time: True
+    smoothing_frequency: 20.0
+    stamp_smoothed_velocity_with_smoothing_time: False
+    scale_velocities: False
+    feedback: "OPEN_LOOP"
+    # ★ 三组上下限全部对齐 xacro 里的 max_*_vel / max_*_acc。
+    #   [vx, vy, wz]；vy 恒为 0（差速车不做横向运动）。
+    #   这里如果比 DiffDrive 插件的上限大，两边会互相打架（插件会在
+    #   加速度上再截一次，表现为"控制器以为发出去了但车没跟上"）。
+    max_velocity: [0.5, 0.0, 1.5]
+    min_velocity: [-0.5, 0.0, -1.5]
+    max_accel: [0.5, 0.0, 2.0]
+    max_decel: [-0.5, 0.0, -2.0]
+    odom_topic: "odom"
+    odom_duration: 0.1
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 1.0
+
+# ★ 上游默认 base_frame_id 是 base_footprint，我们没这个 link，必须改。
+#   另外上游 scan 源的 min_height 是 0.15，而我们的雷达装在 base_link
+#   上方 0.12 m —— 也就是说扫描点在 base_link 系里 z≈0.12，全部会被
+#   "太矮"过滤掉，collision_monitor 就变成了瞎的（虽然不会挡路，
+#   但紧急制动形同虚设）。改成 0.0。
+collision_monitor:
+  ros__parameters:
+    use_sim_time: True
+    base_frame_id: "base_link"
+    odom_frame_id: "odom"
+    cmd_vel_in_topic: "cmd_vel_smoothed"
+    cmd_vel_out_topic: "cmd_vel"
+    state_topic: "collision_monitor_state"
+    transform_tolerance: 0.2
+    source_timeout: 1.0
+    base_shift_correction: True
+    stop_pub_timeout: 2.0
+    polygons: ["FootprintApproach"]
+    FootprintApproach:
+      type: "polygon"
+      action_type: "approach"
+      footprint_topic: "/local_costmap/published_footprint"
+      time_before_collision: 1.2
+      simulation_time_step: 0.1
+      min_points: 6
+      visualize: False
+      enabled: True
+    observation_sources: ["scan"]
+    scan:
+      type: "scan"
+      topic: "scan"
+      min_height: 0.0
+      max_height: 2.0
+      enabled: True
+
+# 我们不做自动回充，但这个节点也在 lifecycle 列表里，保留默认即可。
+docking_server:
+  ros__parameters:
+    use_sim_time: True
+    controller_frequency: 50.0
+    initial_perception_timeout: 5.0
+    wait_charge_timeout: 5.0
+    dock_approach_timeout: 30.0
+    undock_linear_tolerance: 0.05
+    undock_angular_tolerance: 0.1
+    max_retries: 3
+    base_frame: "base_link"
+    fixed_frame: "odom"
+    dock_backwards: false
+    dock_prestaging_tolerance: 0.5
+    dock_plugins: ['simple_charging_dock']
+    simple_charging_dock:
+      plugin: 'opennav_docking::SimpleChargingDock'
+      docking_threshold: 0.05
+      staging_x_offset: -0.7
+      use_external_detection_pose: false
+      use_battery_status: false
+      use_stall_detection: false
+      external_detection_timeout: 1.0
+      external_detection_translation_x: -0.18
+      external_detection_translation_y: 0.0
+      external_detection_rotation_roll: -1.57
+      external_detection_rotation_pitch: -1.57
+      external_detection_rotation_yaw: 0.0
+      filter_coef: 0.1
+    controller:
+      k_phi: 3.0
+      k_delta: 2.0
+      v_linear_min: 0.15
+      v_linear_max: 0.15
+      use_collision_detection: true
+      costmap_topic: "local_costmap/costmap_raw"
+      footprint_topic: "local_costmap/published_footprint"
+      transform_tolerance: 0.1
+      projection_time: 5.0
+      simulation_step: 0.1
+      dock_collision_threshold: 0.3

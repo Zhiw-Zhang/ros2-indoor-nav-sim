@@ -4,8 +4,13 @@ project(my_robot_description)
 find_package(ament_cmake REQUIRED)
 
 install(
-  DIRECTORY urdf launch worlds config docs
+  DIRECTORY urdf launch worlds config maps docs
   DESTINATION share/${PROJECT_NAME}
 )
+
+# 注意：--symlink-install 的符号链接是**按文件**建的，不是按目录。
+# 所以每次在下面这些目录里**新增**文件（新的 launch、新的 rviz 配置、
+# 新的地图 …），都必须重新 colcon build --symlink-install 一次，
+# install/ 里才会出现对应的链接。改已有文件的内容不需要重新 build。
 
 ament_package()
