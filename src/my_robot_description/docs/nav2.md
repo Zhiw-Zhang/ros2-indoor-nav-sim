@@ -365,5 +365,9 @@ has_slam_toolbox_params = HasNodeParams(params_file, 'slam_toolbox')
   第一个该看的就是它。
 * 默认用固定地图 `maps/rooms.yaml`。换场地有两条路：先按 `slam.md` 重新建图再跑本
   文件；或者直接用 `slam:=true` 边建图边导航（见上一节，实测 4/4 目标成功）。
+* 包内另有一张同样用 `rooms.sdf` 建的地图 `maps/rooms_manual.yaml`（**手动遥控**
+  走的，质量比 `rooms.yaml` 略好：到墙均值 1.12 cm vs 1.50 cm，覆盖率 87.1% vs
+  78.2%）。默认没用它，想换就传 `map:=$(ros2 pkg prefix my_robot_description)/share/my_robot_description/maps/rooms_manual.yaml`。
+  两张图的验收数据见 `scripts/mapeval.py` 的说明（`docs/tools.md`）。
 * 还没做的：多点巡航（`nav2_waypoint_follower`）、自动回充（`docking_server`
   已经在 lifecycle 里跑着但没配 dock）、`nav2_collision_monitor` 的减速/停车区。

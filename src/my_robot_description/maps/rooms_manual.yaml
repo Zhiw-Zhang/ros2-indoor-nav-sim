@@ -1,0 +1,26 @@
+# rooms.sdf（两间房 + 一段走廊）的栅格地图 —— **手动遥控**建的版本。
+#
+# 与同目录的 rooms.yaml 是同一个 world、同一套 SLAM 参数（config/slam_toolbox.yaml），
+# 区别只在"谁在开车"：rooms.yaml 是早期用脚本按固定路点跑出来的，
+# 这张是人拿 teleop_twist_keyboard 手动走完的。
+#
+# 来历：ros2 launch my_robot_description slam.launch.py → 遥控走一圈 →
+#       map_saver_cli 保存。完整流程见 docs/slam.md。
+#
+# ⚠ 这张图当时是存在临时目录里、从实时 /map 话题抓下来的，**没有回放数据**。
+#   也就是说不像 rooms.yaml 那样有对应的建图过程记录，只有结果。
+#
+# 两者用同一套脚本（scripts/mapeval.py）验收的对比：
+#   rooms_manual（本图）  占用格到墙均值 1.12 cm，≤5cm 99.95%，幻影墙 0，覆盖率 87.1%
+#   rooms                 占用格到墙均值 1.50 cm，≤5cm 85.70%，幻影墙 0，覆盖率 78.2%
+#   三个门洞都通畅（9.3% / 5.6% / 5.6%，同方法量真实墙段是 40~70%）
+#
+# 想用它当默认地图：把 launch/nav.launch.py 里 map_yaml 的默认值改成
+# 本文件，或者每次启动传 map:=$(ros2 pkg prefix ...)/share/.../maps/rooms_manual.yaml
+image: rooms_manual.pgm
+mode: trinary
+resolution: 0.05
+origin: [-5.021, -2.502, 0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196
