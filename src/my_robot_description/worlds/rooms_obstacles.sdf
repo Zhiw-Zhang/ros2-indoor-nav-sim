@@ -1,0 +1,288 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+  <!-- ================================================================
+       室内世界（带障碍物）：rooms.sdf 的墙体 + 5 个静态障碍物
+
+       俯视布局（单位 m，坐标原点是机器人出生点 (0,0)，在房间 A 里）：
+
+         y=+2.5  ┌──────────────────────────────────────────┐
+                 │        走廊 1.35m 宽                      │
+                 │              ▓▓▓ obs_corridor (0,1.55)    │
+         y=+1.0  ├────┬─────┴─────────┬────────┬────────────┤
+                 │门A  │               │  门B   │            │
+                 │    │    门AB▓       │        │  obs_pole  │
+                 │ 房间A ▓obs_roomA    │  房间B  │   (2.2,0.4)│
+                 │      (-1.6,-1.0)   │        │  ╱obs_roomB_slant
+         y=-2.5  └──────┴───────────────┴────────┴───────────┘
+                x=-5    -2.5    0     1   3     5
+                                       ↑ 机器人出生点 (0,0)
+
+       障碍物一览（全部 static，高 1.0 m；雷达装在 z≈0.22，必定打得到）：
+
+         名称               位置            尺寸          剩余可通行间隙
+         obs_corridor      (0.0, 1.55)   1.20×0.40   南 0.275 / 北 0.675
+         obs_roomA_block   (-1.6,-1.0)   0.80×0.80   四周均 ≥1.0
+         obs_door_ab       (1.0, -0.6)   0.30×0.30   两侧各 0.300 ← 门被封死
+         obs_roomB_slant   (3.4, -1.4)   1.60×0.35   绕 25°
+         obs_pole          (2.2,  0.4)   0.06×0.06   细杆
+
+       设计意图：
+       - 机器人 footprint 0.40×0.37，内切半径 0.185 m。任何小于 0.37 m 的
+         缝隙对它来说都等于封死。
+       - obs_door_ab 正塞在门 AB（0.90 m 宽）的正中间，两侧只剩 0.300 m，
+         于是"房间 A ←→ 房间 B"的最短直线路径被彻底切断。要去房间 B
+         必须绕：房间A → 门A → 走廊(贴北墙过 obs_corridor) → 门B → 房间B，
+         约 12–14 m。这条路线同时逼着规划器绕开走廊里的障碍物。
+       - obs_roomB_slant 是绕 z 转 25° 的斜墙，用来检验 SLAM 对非轴对齐
+         墙面的还原，以及规划器对斜向障碍的避让。
+       - obs_pole 只有 6 cm 见方，检验细障碍物能不能进图、会不会被忽略。
+
+       注意：本文件必须自带全部系统插件。显式指定 world 文件时 Gazebo
+       不会并入 /usr/share/gz/gz-sim8/server.config 的默认插件，漏掉
+       user-commands-system 会让 /world/default/create 永远不注册，
+       ros_gz_sim create 无限等待，机器人永远生成不出来。
+       ================================================================ -->
+  <world name="default">
+
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+
+    <light name="sun" type="directional">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>100 100</size>
+            </plane>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>100 100</size>
+            </plane>
+          </geometry>
+          <material>
+            <ambient>0.7 0.7 0.7 1</ambient>
+            <diffuse>0.7 0.7 0.7 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ============================================================
+         外墙：4 面，中心线在 ±5 / ±2.5，四角故意让它们互相重叠
+         （静态 box 重叠没有副作用），这样不用为拐角做特殊处理。
+         ============================================================ -->
+    <model name="wall_south">
+      <static>true</static>
+      <pose>0 -2.5 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>10.15 0.15 2.5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>10.15 0.15 2.5</size></box></geometry>
+          <material><ambient>0.75 0.72 0.65 1</ambient><diffuse>0.75 0.72 0.65 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_north">
+      <static>true</static>
+      <pose>0 2.5 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>10.15 0.15 2.5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>10.15 0.15 2.5</size></box></geometry>
+          <material><ambient>0.75 0.72 0.65 1</ambient><diffuse>0.75 0.72 0.65 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_west">
+      <static>true</static>
+      <pose>-5 0 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.15 5.15 2.5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.15 5.15 2.5</size></box></geometry>
+          <material><ambient>0.75 0.72 0.65 1</ambient><diffuse>0.75 0.72 0.65 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_east">
+      <static>true</static>
+      <pose>5 0 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.15 5.15 2.5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.15 5.15 2.5</size></box></geometry>
+          <material><ambient>0.75 0.72 0.65 1</ambient><diffuse>0.75 0.72 0.65 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ============================================================
+         走廊 / 房间 之间的隔墙：y = 1.0，x 从 -5 到 5。
+         两个门洞各宽 0.9：门A 中心 x=-2.5，门B 中心 x=+3.0。
+         于是被切成 3 段，长度 2.05 + 0.9 + 4.6 + 0.9 + 1.55 = 10.0
+         ============================================================ -->
+    <model name="divider_c_1">
+      <static>true</static>
+      <pose>-3.975 1.0 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>2.05 0.15 2.5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>2.05 0.15 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.82 1</ambient><diffuse>0.85 0.85 0.82 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="divider_c_2">
+      <static>true</static>
+      <pose>0.25 1.0 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>4.6 0.15 2.5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>4.6 0.15 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.82 1</ambient><diffuse>0.85 0.85 0.82 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="divider_c_3">
+      <static>true</static>
+      <pose>4.225 1.0 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>1.55 0.15 2.5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>1.55 0.15 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.82 1</ambient><diffuse>0.85 0.85 0.82 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ============================================================
+         房间 A / B 之间的隔墙：x = 1.0，y 从 -2.5 到 1.0（长 3.5）。
+         一个门洞宽 0.9，中心 y=-0.6，切成 2 段：
+         1.45 + 0.9 + 1.15 = 3.5
+         ============================================================ -->
+    <model name="divider_ab_1">
+      <static>true</static>
+      <pose>1.0 -1.775 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.15 1.45 2.5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.15 1.45 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.82 1</ambient><diffuse>0.85 0.85 0.82 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="divider_ab_2">
+      <static>true</static>
+      <pose>1.0 0.425 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.15 1.15 2.5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.15 1.15 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.82 1</ambient><diffuse>0.85 0.85 0.82 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ============================================================
+         障碍物：名字一律以 obs_ 开头。
+
+         这个前缀是有用途的，不只是命名习惯：
+         scripts/mapeval.py 会据此把"障碍物"和"结构墙"分开统计
+         （derive_doors 找门洞、幻影块判定只用结构墙；障碍物单独报
+         "有没有进图"）。scripts/obs_test.py 的 static 模式也靠它挑出
+         要算间距的目标。改名会让这两个工具失效。
+         ============================================================ -->
+
+    <!-- 走廊中段横躺 1.2 m：南侧只剩 0.275 m（过不去），北侧 0.675 m -->
+    <model name="obs_corridor">
+      <static>true</static>
+      <pose>0.0 1.55 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>1.20 0.40 1.0</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>1.20 0.40 1.0</size></box></geometry>
+          <material><ambient>0.80 0.35 0.20 1</ambient><diffuse>0.80 0.35 0.20 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- 房间 A 正中：挡住出生点 (0,0) → 门A 的直线 -->
+    <model name="obs_roomA_block">
+      <static>true</static>
+      <pose>-1.6 -1.0 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.80 0.80 1.0</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.80 0.80 1.0</size></box></geometry>
+          <material><ambient>0.80 0.35 0.20 1</ambient><diffuse>0.80 0.35 0.20 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- 塞在门 AB 正中间：门宽 0.9，柱子 0.3，两侧各剩 0.300 m < 车宽 0.37
+         → 这个门对机器人等于封死，房间A ↔ 房间B 必须绕走廊 -->
+    <model name="obs_door_ab">
+      <static>true</static>
+      <pose>1.0 -0.6 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.30 0.30 1.0</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.30 0.30 1.0</size></box></geometry>
+          <material><ambient>0.85 0.15 0.15 1</ambient><diffuse>0.85 0.15 0.15 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- 绕 z 转 25°：检验 SLAM 对斜墙的还原 + 规划器对非轴对齐障碍的避让 -->
+    <model name="obs_roomB_slant">
+      <static>true</static>
+      <pose>3.4 -1.4 0.5 0 0 0.4363323</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>1.60 0.35 1.0</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>1.60 0.35 1.0</size></box></geometry>
+          <material><ambient>0.80 0.35 0.20 1</ambient><diffuse>0.80 0.35 0.20 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- 6 cm 见方的细杆：检验细障碍物能不能进图、会不会被规划器忽略 -->
+    <model name="obs_pole">
+      <static>true</static>
+      <pose>2.2 0.4 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.06 0.06 1.0</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.06 0.06 1.0</size></box></geometry>
+          <material><ambient>0.15 0.30 0.80 1</ambient><diffuse>0.15 0.30 0.80 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+  </world>
+</sdf>

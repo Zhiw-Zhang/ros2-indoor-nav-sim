@@ -356,6 +356,68 @@ has_slam_toolbox_params = HasNodeParams(params_file, 'slam_toolbox')
 结论：**一边被 Nav2 拉着跑、一边建出来的地图，质量和不动的建图流程是一个量级**
 （占用格精度还比早期那张更好）。这条路可以放心用来换场地。
 
+## 能过 ≠ 好过：膨胀半径与通道宽度的关系
+
+带障碍物的世界 `worlds/rooms_obstacles.sdf` 里量到的一件事，比上面那条更普遍：
+
+**规划器看的是代价图，不是几何留白。** 障碍物周围按 `inflation_radius: 0.35`
+铺一圈代价，两个障碍物之间哪怕物理上留了 0.7 m，两边各铺 0.35 m 之后中间也
+只剩一条极窄的低代价缝。
+
+用 `scripts/cost_slice.py` 量 `rooms_obstacles.sdf` 走廊里那条通道
+（障碍物 `obs_corridor` 占 y∈[1.35,1.75]，北墙内表面 y=2.425，**物理上留
+0.675 m**，车宽 0.37 m，看着很宽裕）：
+
+```
+   y      x=-0.30 ... x=+0.25        代价
+  2.45    100 100 100 ...            北墙致命
+  2.30     99  99  99 ...            内切膨胀
+  2.25     96  96  96 ...
+  2.20     82  82  82 ...
+  2.15     71  71  71 ...   ← 最便宜的一格也就这样
+  2.10     71  71  71 ...
+  2.05     82  82  82 ...
+  2.00     96  96  96 ...
+  1.95     99  99  99 ...            内切膨胀
+  1.80    100 100 100 ...            障碍物致命
+```
+
+**整条通道没有一格是自由空间（0）。** 这张表是某一时刻的快照，具体数字会在
+61 ~ 99 之间浮动（膨胀层 + 障碍物层当时合成出什么就是什么），**但"没有 0"
+这件事不变** —— 因为它是几何决定的：
+
+```
+通道 0.675 m  <  2 × inflation_radius = 2 × 0.35 = 0.70 m
+```
+
+**两侧的膨胀场本来就是重叠的**，中间不可能留出自由空间。机器人是靠"压在
+内切膨胀区的边界上"擦过去的，没有任何余量。
+
+后果（实测）：在 `rooms_obstacles.sdf` 里，斜墙 `obs_roomB_slant` 东端与东墙
+之间的通道物理上留 0.726 m，代价图里最便宜也是 71、并且**一半格子是 99**。
+机器人偶尔会选这条更短的路进去，然后：
+
+* `planner_server: Failed to create a plan from potential when a legal potential
+  was found. This shouldn't happen.` —— NavFn 有势场却提不出路径
+* `controller_server: Failed to make progress` 反复出现，
+  `waypoint_follower` 最终报 `error_code=105 FAILED_TO_MAKE_PROGRESS`
+* 明明旁边还有一条**代价全 0** 的宽路（往西绕过斜墙西端），但 NavFn 的代价
+  模型里一格 71 只相当于自由格的约 2 倍（`neutral_cost=50`、
+  `cost_factor=0.8`），所以"短而贵"和"长而便宜"两条路算出来几乎一样，
+  规划器会来回摇摆
+
+**这不是 bug，是参数配出来的**。真机上要按实际通道宽度反推 `inflation_radius`：
+
+| 想让它能过 | 通道至少要留 | 其实验算 |
+|---|---|---|
+| 勉强能过（无余量） | `2 × inflation_radius` | 0.35 → 0.70 m |
+| 走得舒服（有 ~0.13 m 余量/侧） | `2 × inflation_radius + 0.26` | 0.35 → 0.96 m |
+
+换句话说：**这车（0.40×0.37）配 `inflation_radius: 0.35` 时，通道宽度最好 ≥ 1.0 m**。
+0.7 m 的缝它能过，但会像上面那样时不时卡住。要跑窄通道就得把
+`inflation_radius` 降到 0.25 左右，代价是贴墙走的余量变小 —— 这个取舍要拿
+实车试，模拟里试不出结论。
+
 ## 障碍物避让：实测发现的问题
 
 `docs/acceptance.md` 里有完整的验收表和复现命令。结论摘要：
@@ -385,9 +447,20 @@ has_slam_toolbox_params = HasNodeParams(params_file, 'slam_toolbox')
   第一个该看的就是它。
 * 默认用固定地图 `maps/rooms.yaml`。换场地有两条路：先按 `slam.md` 重新建图再跑本
   文件；或者直接用 `slam:=true` 边建图边导航（见上一节，实测 4/4 目标成功）。
-* 包内另有一张同样用 `rooms.sdf` 建的地图 `maps/rooms_manual.yaml`（**手动遥控**
-  走的，质量比 `rooms.yaml` 略好：到墙均值 1.12 cm vs 1.50 cm，覆盖率 87.1% vs
-  78.2%）。默认没用它，想换就传 `map:=$(ros2 pkg prefix my_robot_description)/share/my_robot_description/maps/rooms_manual.yaml`。
-  两张图的验收数据见 `scripts/mapeval.py` 的说明（`docs/tools.md`）。
-* 还没做的：多点巡航（`nav2_waypoint_follower`）、自动回充（`docking_server`
-  已经在 lifecycle 里跑着但没配 dock）、`nav2_collision_monitor` 的减速/停车区。
+* 包内另有两张地图：
+  * `maps/rooms_manual.yaml`（同样用 `rooms.sdf`，**手动遥控**走的，质量比
+    `rooms.yaml` 略好：到墙均值 1.12 cm vs 1.50 cm，覆盖率 87.1% vs 78.2%）；
+  * `maps/rooms_obstacles.yaml`（**带 5 个障碍物的新世界** `worlds/rooms_obstacles.sdf`，
+    自动覆盖路线建的：到墙均值 1.62 cm、覆盖率 96.27%、5 个障碍物全部进图）。
+    用它要同时换 world 和 map：
+    `ros2 launch my_robot_description nav.launch.py world:=rooms_obstacles.sdf map:=$(ros2 pkg prefix my_robot_description)/share/my_robot_description/maps/rooms_obstacles.yaml`
+
+  三张图的逐格比对数据见 `docs/tools.md`；带障碍物那轮的完整验收表见
+  `docs/acceptance.md`。
+* 多点巡航（`nav2_waypoint_follower`）已经打通：`nav_goals.py --mode follow_waypoints`
+  一次下发全部路点，某个点到不了时按 `stop_on_failure` 跳过继续并报出错误码
+  （实测 5/5、以及"故意塞一个落在障碍物里的点"两轮，见 `docs/acceptance.md` ③）。
+* 还没做的：自动回充（`docking_server` 已经在 lifecycle 里跑着但没配 dock）、
+  `nav2_collision_monitor` 的减速/停车区（现在是单个 `FootprintApproach` polygon）。
+* **`inflation_radius` 要按实车场地重新定**：0.35 这个值配 0.4 m 宽的车，
+  通道宽度得 ≥ 1.0 m 才走得舒服，见本节"能过 ≠ 好过"。

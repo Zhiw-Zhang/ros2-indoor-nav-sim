@@ -280,7 +280,8 @@ def generate_launch_description():
                         'false=用 map_server+AMCL 在已有地图上定位（默认）'),
         DeclareLaunchArgument(
             'world', default_value='rooms.sdf',
-            description='worlds/ 下的 world 文件名（仅 sim:=true 时有意义）'),
+            description='worlds/ 下的 world 文件名（仅 sim:=true 时有意义）。'
+                        'rooms.sdf=两间房+走廊，rooms_obstacles.sdf=带 5 个障碍物'),
         DeclareLaunchArgument(
             'map', default_value='',
             description='地图 yaml 的绝对路径，默认用包内 maps/rooms.yaml'),

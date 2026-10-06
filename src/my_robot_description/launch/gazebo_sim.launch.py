@@ -53,8 +53,10 @@ def _launch_setup(context, *args, **kwargs):
     pkg_share = get_package_share_directory('my_robot_description')
     urdf_file = os.path.join(pkg_share, 'urdf', 'my_robot.urdf.xacro')
 
-    # world 可切换：rooms.sdf（两间房+走廊，默认，用于 SLAM/Nav2）
-    #               empty.sdf（一面墙+一个盒子，用于雷达读数回归验证）
+    # world 可切换：
+    #   rooms.sdf           （两间房+走廊，无障碍，SLAM/Nav2 基线）
+    #   rooms_obstacles.sdf （rooms + 5 个静态障碍物，门AB 被封死）
+    #   empty.sdf           （一面墙+一个盒子，雷达读数回归验证）
     world_name = context.launch_configurations.get('world', 'rooms.sdf')
     world_file = os.path.join(pkg_share, 'worlds', world_name)
     if not os.path.isfile(world_file):
@@ -111,6 +113,13 @@ def _launch_setup(context, *args, **kwargs):
             '/tf@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V',
             '/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock',
             '/scan@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan',
+            # 仿真真值位姿（/world/default/dynamic_pose/info 由 SceneBroadcaster
+            # 发布，含所有非 static 实体的世界坐标）。
+            # 为什么要它：DiffDrive 的 /odom 是拿轮子转速积分出来的，原地转
+            # 时因侧滑，转角是真值的 1.37 倍（见 urdf 里 wheel_separation_scale
+            # 的注释），拿它判"有没有撞到东西"会得出错结论。真值位姿没有这个问题，
+            # 是 scripts/obs_test.py --static 做零接触判定的依据。
+            '/world/default/dynamic_pose/info@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V',
         ],
         parameters=[{'use_sim_time': True}],
         output='screen'
@@ -155,7 +164,8 @@ def generate_launch_description():
             description='是否随仿真启动 RViz2 查看 /scan 点云'),
         DeclareLaunchArgument(
             'world', default_value='rooms.sdf',
-            description='worlds/ 下的 world 文件名。rooms.sdf=两间房+走廊，'
+            description='worlds/ 下的 world 文件名。rooms.sdf=两间房+走廊（基线），'
+                        'rooms_obstacles.sdf=rooms+5 个静态障碍物，'
                         'empty.sdf=单面墙（雷达回归验证用）'),
         OpaqueFunction(function=_launch_setup),
     ])

@@ -10,12 +10,19 @@
 * 幻影墙：整块离真实墙面 >15 cm 的连通分量（地图上凭空多出来的东西）
 * 可见墙面覆盖率：沿真实墙面采样，10 cm 内有没有占用格
 * 门洞通畅度：每个门洞里有多少占用格（理想是 0）
+* 障碍物进图情况：名字以 `obs_` 开头的 box 单独统计——离它最近的占用格
+  有多远（理想 ≈0）、它的边界被覆盖了多少
 * 真实墙段对照：同样方法量一段确实是墙的地方，作为"该有多少"的参照
 * 整体平移：地图相对 world 的最佳对齐偏移量
 
 墙面与门洞**从 SDF 自动解析**（只认 box 几何，ground_plane 那种 plane 会被
 忽略），所以换 world 不用改这个脚本。门洞由"同一堵墙上共线的两段 box 之间的
 空隙"推出。
+
+障碍物与结构墙靠**名字前缀**区分：`obs_*` 算障碍物，其余算结构墙。
+门洞推导、幻影块判定、对照墙段只用结构墙（不然障碍物之间、障碍物与墙之间
+的空隙会被误判成门洞）；而"占用格到最近几何体"的距离用**全部** box，
+因为障碍物在图上本来就该有占用格。
 """
 import argparse
 import json
@@ -209,13 +216,17 @@ def components(occ):
     return lab, cur
 
 
-def band_occupancy(m, axis, lo, hi, p0, p1):
-    """在 [lo,hi] x [p0,p1] 这个矩形里数占用格，返回 (占用数, 总格数)。
+def band_occupancy(m, axis, lo, hi, p0, p1, exclude=()):
+    """在 [lo,hi] x [p0,p1] 这个矩形里数占用格，返回 (占用数, 总格数, 其中落在 exclude 里的)。
 
     ★ 按**格心**遍历，不是按固定步长扫。按步长扫的话，采样点落在地图网格
     之外会被静默丢掉，于是同一个物理区域在不同地图上采到的格数不一样
     （实测过：同一段 1 m 墙，两张图一个采到 3 行、一个只采到 1 行），
     跨地图就没法比了。
+
+    exclude 是一组 (name, x0, x1, y0, y1)。门洞里本来就有障碍物的 world
+    （比如 rooms_obstacles.sdf 里被柱子塞住的门AB），那些占用格是**应该**
+    有的，不减掉就会把"柱子画对了"误判成"门被墙封死了"。
     """
     res, ox, oy, h, w = m['res'], m['ox'], m['oy'], m['h'], m['w']
     oy_max = oy + h * res
@@ -225,7 +236,7 @@ def band_occupancy(m, axis, lo, hi, p0, p1):
     c1 = int(np.ceil((hi - ox) / res)) + 1
     r0 = int(np.floor((oy_max - p1) / res))
     r1 = int(np.ceil((oy_max - p0) / res)) + 1
-    n = tot = 0
+    n = tot = nex = 0
     for r in range(max(0, r0), min(h, r1)):
         cy = oy + (h - 1 - r + 0.5) * res
         if not (p0 <= cy <= p1):
@@ -234,8 +245,12 @@ def band_occupancy(m, axis, lo, hi, p0, p1):
             cx = ox + (c + 0.5) * res
             if lo <= cx <= hi:
                 tot += 1
-                n += bool(m['occ'][r, c])
-    return n, tot
+                if m['occ'][r, c]:
+                    n += 1
+                    if any(x0 <= cx <= x1 and y0 <= cy <= y1
+                           for _, x0, x1, y0, y1 in exclude):
+                        nex += 1
+    return n, tot, nex
 
 
 def coverage_of_segments(m, segs, radius=0.10):
@@ -289,10 +304,14 @@ def best_shift(X, Y, occ, walls, span=0.10, step=0.01):
 # --------------------------------------------------------------------------
 def evaluate(map_yaml, world_sdf, do_shift=True):
     m = load_map(map_yaml)
-    walls = parse_world(world_sdf)
+    solids = parse_world(world_sdf)
+    walls = [w for w in solids if not w[0].startswith('obs_')]
+    obstacles = [w for w in solids if w[0].startswith('obs_')]
+    if not walls:
+        raise SystemExit(f'{world_sdf}: 除障碍物外没有任何结构墙，没法评估')
     doors = derive_doors(walls)
     X, Y = cell_centers(m)
-    D = dist_to_walls(X, Y, walls)
+    D = dist_to_walls(X, Y, solids)      # 距离用全部几何体：障碍物在图上也是占用格
     occ, unk, free = m['occ'], m['unk'], m['free']
     tot = m['h'] * m['w']
 
@@ -317,19 +336,32 @@ def evaluate(map_yaml, world_sdf, do_shift=True):
                     'le15': 100 * float((do <= 0.15).mean())},
         'components': ncomp, 'phantom_blocks': len(phantom), 'phantom_big': len(big),
         'coverage_pct': 100.0 * hit / wtot, 'coverage': [hit, wtot],
-        'doors': [], 'control': None,
+        'doors': [], 'obstacles': [], 'control': None,
     }
     for label, axis, lo, hi, p0, p1 in doors:
-        n, t = band_occupancy(m, axis, lo, hi, p0, p1)
+        n, t, nex = band_occupancy(m, axis, lo, hi, p0, p1, obstacles)
         out['doors'].append({'label': label, 'occupied': n, 'cells': t,
-                             'pct': 100.0 * n / max(t, 1), 'area': [lo, hi, p0, p1]})
+                             'occupied_in_obstacle': nex, 'occupied_net': n - nex,
+                             'pct': 100.0 * (n - nex) / max(t, 1),
+                             'area': [lo, hi, p0, p1]})
+
+    # 障碍物：最近占用格有多远（进图了就该 ≈0）+ 边界覆盖率
+    for name, x0, x1, y0, y1 in obstacles:
+        dmin = float(dist_to_walls(X[occ], Y[occ], [(name, x0, x1, y0, y1)]).min()) \
+            if occ.any() else float('inf')
+        oh, ot = coverage_of_segments(m, [(x0, x1, y0, y1)], 0.10)
+        out['obstacles'].append({
+            'name': name, 'rect': [x0, x1, y0, y1],
+            'min_dist_cm': 100 * dmin, 'perimeter_hit': oh, 'perimeter_cells': ot,
+            'perimeter_pct': 100.0 * oh / max(ot, 1)})
+
     cname, cseg = longest_wall_segment(walls)
     chit, ctot = coverage_of_segments(m, [cseg])
     out['control'] = {'wall': cname, 'segment': list(cseg), 'hit': chit,
                       'cells': ctot, 'pct': 100.0 * chit / max(ctot, 1)}
 
     if do_shift:
-        mm, dx, dy = best_shift(X, Y, occ, walls)
+        mm, dx, dy = best_shift(X, Y, occ, solids)
         out['shift'] = {'dx_cm': 100 * dx, 'dy_cm': 100 * dy, 'mean_cm': 100 * mm}
     return out
 
@@ -352,18 +384,82 @@ def print_report(o):
           f"（≥4 格的 {o['phantom_big']} 个）")
     print(f"\n-- 可见墙面覆盖率（墙面采样点 10 cm 内有占用格）--")
     print(f"  {o['coverage'][0]}/{o['coverage'][1]} = {o['coverage_pct']:.2f}%")
-    print(f"\n-- 门洞通畅度（门洞里的占用格，理想 0）--")
+    print(f"\n-- 门洞通畅度（门洞里的占用格，理想 0；门里本来就有障碍物的会剔除）--")
     for dr in o['doors']:
         flag = '✅' if dr['pct'] < 25 else ('⚠️' if dr['pct'] < 50 else '❌')
+        extra = (f"（其中 {dr['occupied_in_obstacle']} 格是门里那个障碍物本身）"
+                 if dr['occupied_in_obstacle'] else '')
         print(f"  {flag} {dr['label']:<26s} {dr['occupied']:>3d}/{dr['cells']:<3d}"
-              f" 占用 ({dr['pct']:5.1f}%)")
+              f" 占用，净 {dr['occupied_net']:>3d} ({dr['pct']:5.1f}%){extra}")
     c = o['control']
     print(f"  对照 · 最长墙({c['wall']})中段 1 m 的覆盖率 : "
           f"{c['hit']}/{c['cells']} = {c['pct']:.1f}%")
+    if o['obstacles']:
+        print(f"\n-- 障碍物进图情况（最近的占用格离它多远 / 边界被覆盖多少）--")
+        for ob in o['obstacles']:
+            flag = '✅' if ob['min_dist_cm'] <= 5.0 else (
+                '⚠️' if ob['min_dist_cm'] <= 15.0 else '❌')
+            print(f"  {flag} {ob['name']:<18s} 最近占用格 {ob['min_dist_cm']:5.1f} cm"
+                  f" | 边界覆盖 {ob['perimeter_hit']:>3d}/{ob['perimeter_cells']:<3d}"
+                  f" = {ob['perimeter_pct']:5.1f}%")
+        print("  （边界覆盖率不会到 100%：背对机器人轨迹的那几面雷达本来就看不到）")
     if 'shift' in o:
         s = o['shift']
         print(f"\n-- 最佳整体平移（对齐 world）--")
         print(f"  dx {s['dx_cm']:+.1f} cm, dy {s['dy_cm']:+.1f} cm → 平均距离 {s['mean_cm']:.2f} cm")
+
+
+def render_png(map_yaml, world_sdf, out_png, scale=4):
+    """画一张"地图 vs 真实几何"的对照图。
+
+    黑色 = 占用格，白色 = 空闲，灰色 = 未知；
+    蓝框 = world 里的结构墙，红框 = obs_* 障碍物的**未旋转 AABB**。
+    斜着放的障碍物（obs_roomB_slant）框会比实体大一圈，这是 AABB 的固有
+    保守性，不是地图错了。
+    """
+    from PIL import Image, ImageDraw                    # noqa: PLC0415
+
+    m = load_map(map_yaml)
+    solids = parse_world(world_sdf)
+    h, w, res, ox, oy = m['h'], m['w'], m['res'], m['ox'], m['oy']
+    img = Image.new('RGB', (w, h), (128, 128, 128))
+    px = img.load()
+    for r in range(h):
+        for c in range(w):
+            if m['occ'][r, c]:
+                px[c, r] = (0, 0, 0)
+            elif m['free'][r, c]:
+                px[c, r] = (255, 255, 255)
+    img = img.resize((w * scale, h * scale), Image.NEAREST)
+    dr = ImageDraw.Draw(img)
+    try:
+        from PIL import ImageFont                       # noqa: PLC0415
+
+        def load(path, size=13):
+            return ImageFont.truetype(path, size) if os.path.isfile(path) else None
+
+        # 默认位图字体在 800px 宽的图上几乎看不清。
+        # 而且没有哪个字体两边都行：DejaVu 没有中文字形（中文变豆腐块），
+        # DroidSansFallback 反过来把 ASCII 也画成豆腐块。所以中文标题和
+        # 英文实体名各用一个字体（踩过两次）。
+        font_cjk = load('/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf')
+        font_latin = load('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf')
+    except Exception:                                   # noqa: BLE001
+        font_cjk = font_latin = None
+
+    def to_px(x, y):
+        return ((x - ox) / res * scale, (oy + h * res - y) / res * scale)
+
+    for name, x0, x1, y0, y1 in solids:
+        col = (220, 40, 40) if name.startswith('obs_') else (40, 80, 220)
+        a, b = to_px(x0, y1), to_px(x1, y0)
+        dr.rectangle([a, b], outline=col, width=2)
+        dr.text((a[0] + 3, a[1] + 3), name, fill=col, font=font_latin)
+    dr.text((8, 6), f'{os.path.basename(map_yaml)}   {w}x{h} @ {res} m   '
+                    f'黑=占用格 灰=未知 蓝框=真实墙 红框=真实障碍物',
+            fill=(0, 130, 0), font=font_cjk)
+    img.save(out_png)
+    return out_png
 
 
 def default_world():
@@ -387,6 +483,8 @@ def main(argv=None):
     ap.add_argument('--world', default=None, help='world SDF，默认包内 worlds/rooms.sdf')
     ap.add_argument('--json', action='store_true', help='输出 JSON')
     ap.add_argument('--no-shift', action='store_true', help='跳过整体平移搜索（更快）')
+    ap.add_argument('--png', default=None,
+                    help='额外输出一张"地图 vs 真实几何"的对照图（黑=占用，蓝=墙，红=障碍物）')
     a = ap.parse_args(argv)
 
     world = a.world or default_world()
@@ -397,8 +495,15 @@ def main(argv=None):
         print(json.dumps(o, ensure_ascii=False, indent=2))
     else:
         print_report(o)
-    # 门洞被堵死算失败，方便脚本化
-    return 1 if any(d['pct'] >= 50 for d in o['doors']) else 0
+    if a.png:
+        render_png(a.map, world, a.png)
+        print(f'\n对照图已写出: {a.png}')
+    # 门洞被堵死、或障碍物压根没进图，都算失败，方便脚本化
+    bad_door = any(d['pct'] >= 50 for d in o['doors'])
+    missed = [ob['name'] for ob in o['obstacles'] if ob['min_dist_cm'] > 5.0]
+    if missed:
+        print(f'\n❌ 这些障碍物没有进图: {", ".join(missed)}', file=sys.stderr)
+    return 1 if (bad_door or missed) else 0
 
 
 if __name__ == '__main__':

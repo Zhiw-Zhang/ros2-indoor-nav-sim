@@ -1,0 +1,18 @@
+# rooms_obstacles.sdf（rooms 的墙 + 5 个静态障碍物）的栅格地图，
+# 由 slam_toolbox 在 `nav.launch.py slam:=true world:=rooms_obstacles.sdf`
+# 会话里建图后用 `map_saver_cli` 保存而来。
+#
+# 建图路线不是手动遥控，而是 .simrun/coverage_obs.txt 里那 17 个路点的
+# 自动覆盖路线（门AB 被障碍物封死，所以路线本身是一条绕走廊的大环）。
+# 17/17 到达，用时 303 s。
+#
+# 尺寸核对：200 x 103 格 x 0.05 m = 10.00 x 5.15 m，与 world 的 10 x 5 m
+# 房间范围一致。5 个障碍物全部进图（包括 6 cm 见方的 obs_pole），
+# 与解析几何的逐格比对结果见 docs/acceptance.md。
+image: rooms_obstacles.pgm
+mode: trinary
+resolution: 0.050
+origin: [-4.973, -2.622, 0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196

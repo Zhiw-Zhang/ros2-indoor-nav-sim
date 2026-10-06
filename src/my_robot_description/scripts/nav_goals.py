@@ -203,30 +203,43 @@ class GoalRunner(Node):
         return missed, elapsed
 
 
-# nav2 规划类错误码（来自 nav2_msgs/ComputePathToPose.action）。
-# FollowWaypoints 的 MissedWaypoint.error_code 就是这一套。
+# MissedWaypoint.error_code 实际会带**两套**错误码：
+#   * 算不出路径时给 ComputePathToPose 那套（200 段）
+#   * 路径算出来了但走不动时给 FollowPath 那套（100 段）
+# 一开始只列了前者，于是 ③-B 报出 "error_code=105" 时看不出是什么意思
+# （105 = FAILED_TO_MAKE_PROGRESS，就是"车走不动"）。
 WP_ERR = {
+    # nav2_msgs/action/FollowPath
+    100: ' UNKNOWN', 101: ' INVALID_CONTROLLER', 102: ' TF_ERROR',
+    103: ' INVALID_PATH', 104: ' PATIENCE_EXCEEDED',
+    105: ' FAILED_TO_MAKE_PROGRESS', 106: ' NO_VALID_CONTROL',
+    107: ' CONTROLLER_TIMED_OUT',
+    # nav2_msgs/action/ComputePathToPose
     200: ' UNKNOWN', 201: ' INVALID_PLANNER', 202: ' TF_ERROR',
     203: ' START_OUTSIDE_MAP', 204: ' GOAL_OUTSIDE_MAP', 205: ' START_OCCUPIED',
     206: ' GOAL_OCCUPIED', 207: ' TIMEOUT', 208: ' NO_VALID_PATH',
+    # FollowWaypoints 自己的
     600: ' UNKNOWN', 601: ' TASK_EXECUTOR_FAILED',
 }
 
 
 def _protect_negative_goals(argv):
-    """在第一个"看起来像坐标"的参数（可能是负号开头）前插一个 `--`。
+    """把"看起来像坐标"的位置参数挪到 `--` 之后，避免被 argparse 当成选项。
 
     argparse 会把 `-2.5,0.6` 当成选项；用户自己写 `--` 又会被 `ros2 run` 吞掉。
-    所以在脚本内部补一个，用户直接写负坐标就行。
+    所以在脚本内部补一个。
+
+    ★ 不能只"插一个 -- 就完事"：一旦插进去，**后面所有东西都变成位置参数**，
+    于是 `nav_goals.py 0.0,0.0 --timeout 200` 里的 `--timeout` 会被当成目标，
+    报 `目标格式应为 x,y[,yaw_deg]，收到 '--timeout'`（踩过）。
+    正确做法是把选项留在前面、只把坐标挪到最后。
     """
-    pat = re.compile(r'^-?\d+(\.\d+)?,-?\d+')
-    out, inserted = [], False
-    for a in argv:
-        if not inserted and a != '--' and pat.match(a):
-            out.append('--')
-            inserted = True
-        out.append(a)
-    return out
+    pat = re.compile(r'^-?\d+(\.\d+)?,-?\d+(\.\d+)?(,-?\d+(\.\d+)?)?$')
+    goals = [a for a in argv if a != '--' and pat.match(a)]
+    if not goals:
+        return argv
+    rest = [a for a in argv if a != '--' and not pat.match(a)]
+    return rest + ['--'] + goals
 
 
 def main(argv=None):

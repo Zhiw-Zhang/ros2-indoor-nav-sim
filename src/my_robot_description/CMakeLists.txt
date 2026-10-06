@@ -4,19 +4,21 @@ project(my_robot_description)
 find_package(ament_cmake REQUIRED)
 
 install(
-  DIRECTORY urdf launch worlds config maps docs
+  DIRECTORY urdf launch worlds config maps routes docs
   DESTINATION share/${PROJECT_NAME}
 )
 
 # 工具脚本，装到 lib/${PROJECT_NAME} 下，用 `ros2 run` 调用：
 #     ros2 run my_robot_description mapeval.py maps/rooms.yaml
 #     ros2 run my_robot_description nav_goals.py -2.5,1.9 2.5,1.9
+#     ros2 run my_robot_description cost_slice.py 4.0,4.95,-2.4,-0.85
 #     ros2 run my_robot_description xwd2png.py in.xwd out.png
 # 用 install(PROGRAMS ...) 而不是 install(FILES ...)，前者会带上可执行位。
 install(PROGRAMS
   scripts/mapeval.py
   scripts/obs_test.py
   scripts/nav_goals.py
+  scripts/cost_slice.py
   scripts/xwd2png.py
   DESTINATION lib/${PROJECT_NAME}
 )

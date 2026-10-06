@@ -1,0 +1,9 @@
+# ③-B 故意在中间插一个**落在障碍物里**的路点：门AB 正中的 obs_door_ab
+# 实测结果：它报 208 NO_VALID_PATH（不是 GOAL_OCCUPIED 206——目标是"不可达"
+# 而不是"里面有障碍"这个区别 NavFn 没分开报），
+# 而第 1 个路点会报 105 FAILED_TO_MAKE_PROGRESS（见 docs/acceptance.md
+# 的"窄通道会卡死"一节）。stop_on_failure=false，所以 #3 #4 照走完。
+-4.0,  0.4     # 房间A 西北角（实测就是这一个报 105）
+ 1.0, -0.6     # ← 落在 obs_door_ab 里，报 208
+ 4.3,  1.6     # 走廊东端
+ 3.0,  0.55    # 穿门B 进房间B
