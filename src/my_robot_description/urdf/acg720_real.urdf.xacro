@@ -1,0 +1,202 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="acg720_car">
+
+  <!-- ================================================================
+       ACG720 真车 URDF（**没有 Gazebo 插件、没有 Gazebo sensor**）
+       ================================================================
+       这份文件只做三件事，全部与仿真无关：
+
+         1. 给 robot_state_publisher 用：发布 base_link → laser_frame 等固定 TF
+         2. 给 Nav2 用：footprint / 几何尺寸
+         3. 给 RViz 用：看得见车
+
+       ★ 它**不**发布 odom → base_link。那条 TF 由 acg720_driver 按编码器
+         积分发出。如果这里也发，就会出现两个节点抢同一条 TF，tf2 会刷
+         "TF_REPEATED_DATA" 警告，RViz 里车会抖。
+
+       与仿真 URDF（my_robot.urdf.xacro）的差异：
+         - 仿真：gz-sim-diff-drive-system 插件发 odom + TF；gpu_lidar 发 /scan
+         - 真机：acg720_driver 发 odom + TF；雷达由独立驱动节点发 /scan
+
+       ★★ 下面的 property 是本文件**唯一**依赖实车实测值的地方。
+          默认值取自交接包 `小车数据总览_实测状态分级.md` 第 4.1 / 4.2 节，
+          标注了每项的可信度。改这里不需要 colcon build（install 是符号链接）。
+       ================================================================ -->
+
+  <!-- === 1. 几何（交接包第 4.1 节）=== -->
+  <!-- 轮径 65 mm → 半径 32.5 mm。【待确认】UNVALIDATED_GEOMETRY -->
+  <xacro:property name="wheel_radius" value="0.0325"/>
+  <!-- 轮距 200 mm。【待确认】未实车标定 -->
+  <xacro:property name="track_width" value="0.200"/>
+  <!-- 轴距 185 mm。【待确认】未实车标定 -->
+  <xacro:property name="wheelbase" value="0.185"/>
+
+  <xacro:property name="wheel_offset_x" value="${wheelbase / 2}"/>   <!-- 0.0925 -->
+  <xacro:property name="wheel_offset_y" value="${track_width / 2}"/> <!-- 0.1    -->
+
+  <!-- 轮胎宽度：**未实测**。仅影响 RViz 观感与碰撞体，不影响运动学 -->
+  <xacro:property name="wheel_width" value="0.026"/>
+
+  <!-- 底盘外形：**未实测**，按 4 个轮子围出的空间估的。
+       ⚠ 这两个值直接决定 Nav2 的 footprint，量出真值后必须同步改
+         config/nav2_params.yaml（局部 + 全局代价地图各一处）。 -->
+  <xacro:property name="base_length" value="0.16"/>
+  <xacro:property name="base_width" value="0.14"/>
+  <xacro:property name="base_height" value="0.06"/>
+
+  <!-- 轮心相对底盘中心的 z。几何自检（必须成立，否则车卡在地上）：
+           底盘底面 z = -base_height/2               = -0.030
+           轮子底面 z = wheel_offset_z - wheel_radius = -0.0325 - 0.0325 = -0.065
+           要求 -0.030 > -0.065  → 离地间隙 35 mm ✓ -->
+  <xacro:property name="wheel_offset_z" value="-0.0325"/>
+
+  <!-- === 2. 质量（**未实测**，仅用于 RViz/惯量显示）=== -->
+  <xacro:property name="base_mass" value="0.60"/>
+  <xacro:property name="wheel_mass" value="0.05"/>
+
+  <!-- === 3. 雷达安装位姿（**待实测**）
+       ★ 上2D雷达（LD19 / RPLIDAR A1 级）之后，用卷尺量这三个值。
+         z 影响代价地图的 obstacle_max_range；x/y 影响 /scan 与车体的相对位置，
+         填错会让 AMCL 定位系统性偏移。 -->
+  <xacro:property name="lidar_mount_x" value="0.0"/>
+  <xacro:property name="lidar_mount_y" value="0.0"/>
+  <xacro:property name="lidar_mount_z" value="0.10"/>
+  <xacro:property name="lidar_radius" value="0.035"/>
+
+  <!-- === 4. 舵机 + VL53L0X 测距头（**待实测角度**）
+       交接包 4.6 节：SG90 类型未实测确认（可能 180° 位置型，也可能 360°
+       连续旋转型；现有 RTL **只兼容前者**）。所以这里只把它作为一个
+       **显示用的固定 link**，标定前不要当作可信的运动学部件。
+
+       扫描角当前代码约定：左 30° / 中 90° / 右 150°（代码参数）。
+       下面按"中位"摆。 -->
+  <xacro:property name="servo_mount_x" value="0.07"/>
+  <xacro:property name="servo_mount_z" value="0.02"/>
+
+  <!-- ================================================================
+       底盘本体
+       ================================================================ -->
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <box size="${base_length} ${base_width} ${base_height}"/>
+      </geometry>
+      <material name="blue">
+        <color rgba="0.2 0.3 0.8 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <box size="${base_length} ${base_width} ${base_height}"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="${base_mass}"/>
+      <inertia ixx="0.002" ixy="0" ixz="0"
+               iyy="0.003" iyz="0"
+               izz="0.004"/>
+    </inertial>
+  </link>
+
+  <!-- ================================================================
+       四个驱动轮
+       轮位约定（与交接包一致）：A=右前 B=左前 C=左后 D=右后
+         ROS 坐标：x 向前，y 向左，z 向上 → 左轮 y=+，右轮 y=−
+       ================================================================ -->
+  <xacro:macro name="drive_wheel" params="name x y">
+    <link name="${name}">
+      <visual>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+        </geometry>
+        <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+        <material name="black">
+          <color rgba="0.1 0.1 0.1 1.0"/>
+        </material>
+      </visual>
+      <collision>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+        </geometry>
+        <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      </collision>
+      <inertial>
+        <mass value="${wheel_mass}"/>
+        <inertia ixx="0.00002" ixy="0" ixz="0"
+                 iyy="0.00002" iyz="0"
+                 izz="0.00002"/>
+      </inertial>
+    </link>
+
+    <joint name="${name}_joint" type="continuous">
+      <parent link="base_link"/>
+      <child link="${name}"/>
+      <origin xyz="${x} ${y} ${wheel_offset_z}" rpy="0 0 0"/>
+      <axis xyz="0 1 0"/>
+    </joint>
+  </xacro:macro>
+
+  <!-- A 右前 -->
+  <xacro:drive_wheel name="wheel_a_front_right" x="${wheel_offset_x}"  y="-${wheel_offset_y}"/>
+  <!-- B 左前 -->
+  <xacro:drive_wheel name="wheel_b_front_left"  x="${wheel_offset_x}"  y="${wheel_offset_y}"/>
+  <!-- C 左后 -->
+  <xacro:drive_wheel name="wheel_c_rear_left"   x="-${wheel_offset_x}" y="${wheel_offset_y}"/>
+  <!-- D 右后 -->
+  <xacro:drive_wheel name="wheel_d_rear_right"  x="-${wheel_offset_x}" y="-${wheel_offset_y}"/>
+
+  <!-- ================================================================
+       雷达（2D 雷达未到货前，这个 link 只用于 RViz 显示）
+       ★ frame 名必须是 laser_frame：nav2_params.yaml / slam_toolbox.yaml
+         里的 frame 引用、以及 sim_nav_ws 仿真里的名字都是它，改名会连锁改配置。
+       ================================================================ -->
+  <link name="laser_frame">
+    <visual>
+      <geometry>
+        <cylinder radius="${lidar_radius}" length="0.04"/>
+      </geometry>
+      <material name="red">
+        <color rgba="0.9 0.1 0.1 1.0"/>
+      </material>
+    </visual>
+    <inertial>
+      <mass value="0.05"/>
+      <inertia ixx="0.00001" ixy="0" ixz="0"
+               iyy="0.00001" iyz="0"
+               izz="0.00001"/>
+    </inertial>
+  </link>
+
+  <joint name="laser_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="laser_frame"/>
+    <origin xyz="${lidar_mount_x} ${lidar_mount_y} ${lidar_mount_z}" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ================================================================
+       舵机 + VL53L0X 测距头（仅显示；扫描角待实测）
+       ================================================================ -->
+  <link name="obstacle_sensor_frame">
+    <visual>
+      <geometry>
+        <box size="0.04 0.02 0.02"/>
+      </geometry>
+      <material name="green">
+        <color rgba="0.1 0.8 0.2 1.0"/>
+      </material>
+    </visual>
+    <inertial>
+      <mass value="0.02"/>
+      <inertia ixx="0.000001" ixy="0" ixz="0"
+               iyy="0.000001" iyz="0"
+               izz="0.000001"/>
+    </inertial>
+  </link>
+
+  <joint name="obstacle_sensor_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="obstacle_sensor_frame"/>
+    <origin xyz="${servo_mount_x} 0 ${servo_mount_z}" rpy="0 0 0"/>
+  </joint>
+
+</robot>

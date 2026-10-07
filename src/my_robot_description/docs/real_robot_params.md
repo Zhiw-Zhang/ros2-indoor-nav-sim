@@ -2,20 +2,58 @@
 
 > 本文件是**逐项的操作手册**（怎么量、填哪、连带改什么）。
 > 整体的搬迁计划——驱动层要新做什么、验证手段为什么会失效、分阶段怎么推进——
-> 见 **`real_robot_plan.md`**。两份配合看：先看计划了解顺序，再回本文查具体怎么量。
+> 见 **`real_robot_plan.md`**。底盘驱动层怎么跑见 **`acg720_protocol.md`**。
+> 三份配合看：先看计划了解顺序，再看驱动层文档知道怎么起车，最后回本文查具体怎么量。
 
-本文件是仿真里**所有依赖实车实测数据**的参数的唯一登记处。
+本文件是仿真与真车里**所有依赖实车实测数据**的参数的唯一登记处。
 
-- 参数本体：`urdf/my_robot.urdf.xacro` 顶部第 30–90 行的一块 `<xacro:property>`（共 6 组）。
+## ⚠ 先搞清楚：现在有**两套** URDF，别改错了
+
+| 文件 | 用途 | 参数来源 |
+|---|---|---|
+| [`urdf/my_robot.urdf.xacro`](../urdf/my_robot.urdf.xacro) | **仿真**（Gazebo） | 按 0.4×0.3 底盘**估的占位值** |
+| [`urdf/acg720_real.urdf.xacro`](../urdf/acg720_real.urdf.xacro) | **真车**（ACG720） | 按交接包几何填（轮径 65 mm / 轮距 200 mm / 轴距 185 mm），**未实测** |
+
+**标定真车时改的是 `acg720_real.urdf.xacro`。** 仿真那份是为了让仿真继续能跑，
+不要因为标定真车就把它一起改了——两份的物理对象不是同一台车。
+
+另外，**两套几何值各自都要和 `config/nav2_params.yaml` 里的 `footprint` 对上**。
+
+- 参数本体：两份 URDF 顶部各自的 `<xacro:property>` 块。
 - 改完**不需要** `colcon build`：`install/` 里是指向源码的符号链接。
   改一行 → `Ctrl-C` → 重跑 launch 即可生效（约 10 秒）。
   （例外：**新增**文件——新的 launch / rviz / 地图——必须重新
   `colcon build --symlink-install`，因为符号链接是按文件建的。）
-- 现在这些值**全是按 0.4×0.3 底盘估的占位值**，不是实测值。
 
-> 为什么现在用占位值也能往后推进：仿真是自洽的，定性结论（不翘头、雷达读数与解析解吻合、
+> 为什么仿真用占位值也能往后推进：仿真是自洽的，定性结论（不翘头、雷达读数与解析解吻合、
 > SLAM 能建图、Nav2 能规划）与具体数值无关；只有"需要标定的数值"（速度上限、打滑比、
 > 代价地图膨胀半径）将来要重调一遍。
+
+---
+
+## 〇、真车几何（`acg720_real.urdf.xacro`，交接包给出的初值）
+
+| xacro property | 交接包初值 | 状态 |
+|---|---|---|
+| `wheel_radius` | 0.0325 m（轮径 65 mm） | **待确认**（`UNVALIDATED_GEOMETRY`） |
+| `track_width` | 0.200 m（轮距 200 mm） | **待确认**（未实车标定） |
+| `wheelbase` | 0.185 m（轴距 185 mm） | **待确认**（未实车标定） |
+| `wheel_width` | 0.026 m | **未实测**，仅影响 RViz 观感 |
+| `base_length` / `base_width` / `base_height` | 0.16 / 0.14 / 0.06 m | **未实测**，按 4 轮围出的空间估的，直接决定 footprint |
+| `wheel_offset_z` | −0.0325 m | 由几何自检约束（离地 35 mm） |
+| `lidar_mount_x/y/z` | 0 / 0 / 0.10 m | **待实测**（雷达到货后量） |
+| `servo_mount_x/z` | 0.07 / 0.02 m | 仅显示用 |
+
+驱动节点用的是**同一组值**，通过 `robot.launch.py` 的参数传入
+（`wheel_radius_m` / `wheel_separation_m` / `wheelbase_m` / `counts_per_rev`）。
+**改一处不够，两边要一致**——否则 URDF 里的车和里程计算出来的车不是同一台。
+
+```bash
+# 真车几何标定后，这样起车（几何与标定值一起传进去）
+ros2 launch my_robot_description robot.launch.py \
+  wheel_radius_m:=0.0325 wheel_separation_m:=0.200 wheelbase_m:=0.185 \
+  counts_per_rev:=1320.0 wheel_separation_scale:=<标定值>
+```
 
 ---
 
@@ -58,6 +96,15 @@ skid-steer 原地旋转时四个轮子必须横向刮擦，编码器积分出来
 
 ### `wheel_separation_scale` 的标定方法
 
+> **★ 真车上的这个系数由谁生效？答：由驱动节点 `acg720_driver`。**
+> 仿真里它塞在 `gz-sim-diff-drive-system` 插件的 `<wheel_separation>` 里；
+> 真机没有那个插件，ACG720 的 FPGA 也不知道这个系数（它只有几何轮距）。
+> 所以驱动节点在**下发和上报两侧同时**把 `b_eff = 轮距 × scale` 打进去。
+> 推导见 [`acg720_protocol.md`](acg720_protocol.md) 第三节。
+>
+> **真车初始值填 `1.0`（不做修正），不要抄仿真表格里的 1.36**——那是
+> ODE 物理引擎 + `wheel_mu_lat=0.5` 的产物，与真车轮胎/地面/负载无关。
+
 1. 让实车**原地**以固定角速度 ω 转固定时间 T（比如 0.6 rad/s 转 15 s）。
 2. 同时记下两件事：
    * **编码器/里程计积分出来的转角** θ_odom（`ros2 topic echo /odom` 的 yaw，注意
@@ -66,11 +113,33 @@ skid-steer 原地旋转时四个轮子必须横向刮擦，编码器积分出来
 3. `scale = θ_odom / θ_true`，填进 `wheel_separation_scale`。
    标定正确后 `θ_odom ≈ θ_true`，且"命令转一圈实际就转一圈"。
 
+⚠ **弯道工况注意低速下限。** 交接包的 F1 验收实测：**内轮目标低于约 7 RPM 时
+车会以约 7 RPM 滑行**（不是故障，是已知特性）。所以标定时别用太小的角速度——
+那样内轮会落在下限区间，"车实际转角"就掺进了滑行量，标出来的 scale 不可信。
+驱动节点碰到这种情况会打 WARN，看到告警就说明这次测量不能用。
+
 ⚠ 转弯半径不同侧滑量不同（原地转刮擦最厉害）。单一标量只能折中，
 **优先照顾原地转**，因为室内导航（穿门、对准）以原地转为主。
 代价是弧线工况标定后仍有残差：仿真实测 v=0.3、ω=+0.5（r=0.6 m）时
 `odom/真值` 从 1.436 只降到 1.091，还差 9%。但这是 9% 而不是 36%，
 已经不影响 AMCL（仿真里 6/6 目标成功，定位均值 6.5 cm）。
+
+### 标定前后的自检（真车）
+
+[`test_hil_end_to_end.py`](../test/test_hil_end_to_end.py) 的第 4、5 项就是这个口径的
+自动化版本，可以直接照它的判据手工做一遍：
+
+| 步骤 | 看什么 | 期望 |
+|---|---|---|
+| 填 1.0，原地转 | `θ_odom / θ_true` | ≈1.36（未标定，里程计高报） |
+| 填标定值，原地转 | `θ_odom / θ_true` | ≈1.00（误差 <5%） |
+
+```bash
+# 一边发角速度一边看里程计（注意：只发一次会因为 cmd_vel_timeout 停车，
+# 必须持续发；这是真机的安全设计）
+ros2 topic pub --rate 20 /cmd_vel geometry_msgs/msg/Twist "{angular: {z: 0.6}}"
+ros2 topic echo /odom --field pose.pose.orientation
+```
 
 ### 当前仿真的实测数据
 

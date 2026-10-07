@@ -149,6 +149,18 @@ def _launch_setup(context, *args, **kwargs):
         pkg_share, 'config', 'nav2_params.yaml')
     slam_params_file = os.path.join(pkg_share, 'config', 'slam_toolbox.yaml')
 
+    # ★ use_sim_time 现在是一个**独立**的 launch 参数，不再硬编码 'true'。
+    #
+    # 为什么不能继续硬编码：真机上 sim:=false 只表示"不启动 Gazebo"，
+    # 此时**没有 /clock 话题**。如果 Nav2 仍开着 use_sim_time=true，它会一直
+    # 等一个永远不来的时钟——表现为节点都起来了、TF 树也全，但**车完全不动**，
+    # 日志里几乎没有报错。这是最难现场排查的一类问题。
+    #
+    # 默认值跟 sim 走（仿真 true、真机 false），也允许单独覆盖，
+    # 以便 HIL 场景用"虚拟底盘 + 真实时钟"的组合。
+    use_sim_time = cfg.get('use_sim_time') or ('true' if sim_on else 'false')
+    use_sim_time_py = _pybool(use_sim_time)
+
     # slam:=true 时地图由 slam_toolbox 现场生成，map:= 会被忽略，
     # 所以那种情况下不检查地图文件是否存在。
     checks = [(params_file, 'Nav2 参数')]
@@ -159,7 +171,9 @@ def _launch_setup(context, *args, **kwargs):
     for path, what in checks:
         if not os.path.isfile(path):
             raise RuntimeError(f'找不到{what}文件: {path}')
-    if not os.path.isfile(os.path.join(pkg_share, 'worlds', world)):
+    # world 只在真的要用它时才检查。真机（sim:=false）上 world 参数毫无意义，
+    # 若还去检查，会因"world 文件不存在"而无谓地启动失败。
+    if sim_on and not os.path.isfile(os.path.join(pkg_share, 'worlds', world)):
         raise RuntimeError(f'找不到 world 文件: {world}')
 
     actions = []
@@ -191,7 +205,7 @@ def _launch_setup(context, *args, **kwargs):
                 get_package_share_directory('slam_toolbox'),
                 'launch', 'online_async_launch.py')),
             launch_arguments={
-                'use_sim_time': 'true',
+                'use_sim_time': use_sim_time,
                 'slam_params_file': slam_params_file,
             }.items(),
         ))
@@ -221,7 +235,7 @@ def _launch_setup(context, *args, **kwargs):
                 # 大写的 Python 字面量，见 _pybool 的说明。
                 'use_localization': 'False' if slam_on else 'True',
                 'map': map_yaml,
-                'use_sim_time': 'true',
+                'use_sim_time': use_sim_time,
                 'params_file': params_file,
                 'autostart': autostart,
                 'use_composition': use_composition,
@@ -259,7 +273,7 @@ def _launch_setup(context, *args, **kwargs):
         executable='rviz2',
         name='rviz2_nav',
         arguments=['-d', os.path.join(pkg_share, 'config', 'nav_view.rviz')],
-        parameters=[{'use_sim_time': True}],
+        parameters=[{'use_sim_time': use_sim_time_py == 'True'}],
         condition=IfCondition(rviz),
         output='screen',
     ))
@@ -278,6 +292,12 @@ def generate_launch_description():
             'slam', default_value='false',
             description='true=用 slam_toolbox 边建图边导航；'
                         'false=用 map_server+AMCL 在已有地图上定位（默认）'),
+        DeclareLaunchArgument(
+            'use_sim_time', default_value='',
+            description='是否使用 /clock 仿真时钟。留空=跟随 sim（仿真 true、'
+                        '真机 false）。★ 真机上必须为 false：sim:=false 时没有 '
+                        '/clock，若仍为 true，Nav2 会等一个不存在的时钟，'
+                        '表现为"节点全起、TF 全有、车就是不动"且几乎不报错'),
         DeclareLaunchArgument(
             'world', default_value='rooms.sdf',
             description='worlds/ 下的 world 文件名（仅 sim:=true 时有意义）。'

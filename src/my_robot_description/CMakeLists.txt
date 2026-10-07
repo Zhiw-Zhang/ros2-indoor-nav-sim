@@ -35,6 +35,14 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
 )
 install(FILES
+  urdf/acg720_real.urdf.xacro
+  DESTINATION share/${PROJECT_NAME}/urdf
+)
+install(FILES
+  launch/robot.launch.py
+  DESTINATION share/${PROJECT_NAME}/launch
+)
+install(FILES
   src/acg720_protocol.py
   src/drive_kinematics.py
   DESTINATION lib/${PROJECT_NAME}

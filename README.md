@@ -161,17 +161,49 @@ ros2 launch my_robot_description nav.launch.py world:=rooms_obstacles.sdf \
 
 ## 真机状态
 
-**目前跑的全是仿真，没有任何真机数据。**
+**真车（ACG720）上还没有跑过，目前没有任何真机实测数据。**
 
-搬到真车要做的事（驱动层、验证手段、安全、分阶段推进）已经整理成
+搬到真车要做的事（验证手段、安全、分阶段推进）整理在
 [`real_robot_plan.md`](src/my_robot_description/docs/real_robot_plan.md)。
-最大的两块：
 
-1. **驱动层完全没有**——现在 `/scan`、`/odom` 都是 Gazebo 插件产生的，
-   要换成真实底盘和雷达的驱动节点。
+### 底盘驱动层：已实现，且**没有硬件也能验证**
+
+ACG720 底盘的串口驱动层已经完成（协议、驱动节点、虚拟底盘、真机 bringup）：
+
+```bash
+# 没有硬件：起虚拟底盘，它会打印 /dev/pts/N
+ros2 run my_robot_description acg720_simulator --no-driver
+
+# 把真机 bringup 指到那个 PTY —— /odom、TF、超时停车全走真实代码路径
+ros2 launch my_robot_description robot.launch.py port:=/dev/pts/N nav:=false
+```
+
+细节见 [`acg720_protocol.md`](src/my_robot_description/docs/acg720_protocol.md)。
+验证规模：**54 例纯函数单测 + 30 项 HIL 集成测试 + 20 项 launch 冒烟测试**，
+含 skid-steer 标定闭环（`θ_odom/θ_true` 从 1.361 收到 1.005）。
+
+### 还差的两块
+
+1. **雷达**——已确认会加 2D 雷达（LD19 / RPLIDAR A1 级），但型号与安装位姿未定。
+   `/scan` 是 SLAM 与 AMCL 的前提，所以**没有它就无法验证三条功能**。
+   `robot.launch.py` 因此默认 `use_laser:=false`，且不绑定任何雷达型号。
 2. **验证手段会失效**——`mapeval.py` 和 `obs_test.py --static` 都依赖仿真真值位姿，
    真机上没有对应物。②"零接触"这个结论在真机上**目前无法证明**。
 
-⚠️ URDF 顶部的 6 组物理参数**全是占位值**（按 0.4×0.3 底盘估的），
-包括 `wheel_separation_scale = 1.36` 和 `inflation_radius = 0.35`。
-清单与测量方法见 [`real_robot_params.md`](src/my_robot_description/docs/real_robot_params.md)。
+### 接真车前必须解决的两条
+
+* ⚠️ **串口 payload 字节布局没有权威来源。** 交接包只给了帧头 `A5 5A` 和命令字
+  （`0x05`/`0x06`/`0x84`），没给字段顺序、字节序和校验方式。本工程自行定义了一套，
+  集中在 `src/acg720_protocol.py` **一个文件**里，必须拿 FPGA 源码核对后才能接真车。
+  布局不对的后果是底盘按错误速度跑，而日志上一切正常。
+* ⚠️ **两套 URDF 的物理参数都未经实车复核。** 仿真用的
+  [`my_robot.urdf.xacro`](src/my_robot_description/urdf/my_robot.urdf.xacro) 是按
+  0.4×0.3 底盘估的占位值（含 `wheel_separation_scale = 1.36`、
+  `inflation_radius = 0.35`）；真车用的
+  [`acg720_real.urdf.xacro`](src/my_robot_description/urdf/acg720_real.urdf.xacro)
+  按交接包几何填（轮径 65 mm、轮距 200 mm、轴距 185 mm），但同样**未实测**。
+  清单与测量方法见 [`real_robot_params.md`](src/my_robot_description/docs/real_robot_params.md)。
+
+> ⚠️ 真机上的 `wheel_separation_scale` **必须重量，不要抄仿真的 1.36**——
+> 那是 ODE 物理引擎 + `wheel_mu_lat=0.5` 的产物，与真车轮胎/地面/负载无关。
+> 真机初始值填 `1.0`，按标定流程填实测值。

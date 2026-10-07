@@ -331,8 +331,9 @@ python3 src/my_robot_description/test/test_hil_end_to_end.py
 
 | 文件 | 内容 | 需要 PTY | 规模 |
 |---|---|---|---|
-| `test/test_protocol_and_kinematics.py` | 纯函数：CRC、帧往返、流式重同步、运动学、位姿积分 | 否 | 50 例 |
-| `test/test_hil_end_to_end.py` | 集成：真驱动节点 + 真 PTY | **是** | 30 项 |
+| `test/test_protocol_and_kinematics.py` | 纯函数：CRC、帧往返、流式重同步、字节布局、运动学、位姿积分 | 否 | 54 例 |
+| `test/test_hil_end_to_end.py` | 集成：真驱动节点 + 真 PTY，测**行为与数值** | **是** | 30 项 |
+| `test/test_bringup_smoke.py` | 接线：真 `ros2 launch` + 真进程，测**能不能起来** | **是** | 20 项 |
 | `acg720_simulator.py --dry-run` | 通道自检 + 缺陷模型自检 | **是** | 4 项 |
 
 ```bash
@@ -341,7 +342,16 @@ python3 -m pytest src/my_robot_description/test/test_protocol_and_kinematics.py 
 
 # 集成部分（要能访问 /dev/ptmx）
 python3 src/my_robot_description/test/test_hil_end_to_end.py
+python3 src/my_robot_description/test/test_bringup_smoke.py
 ```
+
+> **为什么"接线"要单独测一遍。** HIL 测试是自己 `new` 出节点、装到同一个
+> executor 上，**绕过了 launch 系统**；而冒烟测试走真的 `ros2 launch`。
+> "launch 起不来 / 参数没传进去 / 可执行位不对 / install 里缺文件"这类问题
+> 只有真 launch 才暴露。本工程就踩过：`install(PROGRAMS)` 会**照抄源码的权限位**，
+> 源码没 `+x` 时 `ros2 launch` 直接报
+> `executable 'acg720_driver.py' not found on the libexec directory`。
+> 冒烟测试的第 0 步就是专门查这个的。
 
 HIL 里有价值的几项：
 
@@ -368,3 +378,78 @@ HIL 里有价值的几项：
 | `0x07` SET_CONFIG | 预留未实现（改 FPGA 内部限速/阈值） |
 | 换向保护 0x83 code=2 | 协议里定义了，驱动尚未针对它做重试策略 |
 | 雷达驱动 | 用户已确认会加 2D 雷达（LD19 / RPLIDAR A1 级）。本层只做底盘，雷达驱动是独立一块 |
+
+---
+
+## 八、CPR = 1320 的一个旁证（算术自洽，但仍未实车复核）
+
+交接包修正 2 说"1320 counts/输出轴圈，包含正交四倍频的解释仍需实车确认"。
+这里做一个**算术层面**的核对——不是实测，只是看这个数自不自洽：
+
+```
+1320 ÷ 30（减速比） = 44 counts / 电机轴圈
+44  ÷ 4（正交四倍频）= 11 PPR
+```
+
+**11 PPR 恰好是这类直流减速电机最常见的编码器线数**（44 同时也等于
+"22 PPR 二倍频"）。所以 1320 与交接包描述的"减速比 1:30 + 正交四倍频"
+在算术上完全对得上，不存在需要额外解释的因子。
+
+这条旁证能说明什么、不能说明什么：
+
+* ✅ 说明 1320 不是随手写错的数，与"正交四倍频"的说法一致
+* ❌ **不能**替代实车复核。仍然没验证的是：实物编码器是不是真的 11 PPR、
+  FPGA 是不是真做了四倍频、减速比是不是精确 30:1
+* ⚠ 如果实测是 13 PPR（四倍频 = 52 counts/电机轴圈 → 1560 counts/输出轴圈），
+  那么里程计与距离换算会**整体差 18%**——这正是交接包要求"转整数圈实测"的原因
+
+复核口径：手动把**输出轴**转整数圈（例如 10 圈），看累计计数是否为 13200。
+原始 counts 可以直接看 `ros2 topic echo /acg720/telemetry_raw`。
+
+---
+
+## 九、怎么跑起来
+
+```bash
+cd ~/sim_nav_ws && colcon build --symlink-install && source install/setup.bash
+```
+
+### 真机（第一轮：架空车轮，只验底盘）
+
+```bash
+ros2 launch my_robot_description robot.launch.py port:=/dev/ttyUSB0 nav:=false
+# 另开终端遥控；看 /odom 方向、看急停管不管用
+ros2 run teleop_twist_keyboard teleop_twist_keyboard
+ros2 topic echo /odom --field pose.pose.position
+```
+
+`nav:=false` 时**不会**起 Nav2。这是有意的：2D 雷达还没到货，没有 `/scan`
+就没有定位，起 Nav2 只会让人误以为"驱动坏了"。launch 会明确把这一点打出来。
+
+### 真机（第二轮：雷达到货后）
+
+```bash
+ros2 launch my_robot_description robot.launch.py \
+  use_laser:=true lidar_pkg:=ldlidar_ros2 lidar_launch:=ld19.launch.py
+```
+
+本工程**不绑定**雷达型号；`use_laser:=true` 时必须同时给这两个参数，
+否则直接报错——目的是避免"装错驱动的包名、静默不出 `/scan`、却在查底盘"。
+
+### 没有硬件时（虚拟底盘）
+
+```bash
+# 终端 1：虚拟车，打印 /dev/pts/N
+ros2 run my_robot_description acg720_simulator --no-driver
+
+# 终端 2：把真机 bringup 指到那个 PTY
+ros2 launch my_robot_description robot.launch.py port:=/dev/pts/N nav:=false
+```
+
+### 测试
+
+```bash
+python3 -m pytest src/my_robot_description/test/test_protocol_and_kinematics.py -v  # 54 例
+python3 src/my_robot_description/test/test_hil_end_to_end.py                        # 30 项
+python3 src/my_robot_description/test/test_bringup_smoke.py                         # 真 launch 冒烟
+```

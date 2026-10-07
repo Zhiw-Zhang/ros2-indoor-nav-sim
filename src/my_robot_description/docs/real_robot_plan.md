@@ -15,13 +15,30 @@
 | 工作块 | 现状 | 工作量 |
 |---|---|---|
 | 导航层（Nav2 / SLAM / 参数 / 地图 / 路点） | ✅ 与仿真解耦，可直接复用 | 无需重做 |
-| 驱动层（底盘 / 雷达 / TF） | ❌ 完全没有，现在是 Gazebo 插件 | **最大的一块** |
+| **底盘驱动层（ACG720 串口 / /odom / TF）** | **✅ 已做完，且无硬件即可验证** | 剩余：核实 payload 布局 |
 | 参数标定 | ⚠️ 清单已备好，值全是占位 | 中等，但顺序不能错 |
 | **验证手段** | ❌ **现在的方法真机上失效** | 被低估的一块 |
 | 安全措施 | ❌ 仿真里不存在这个概念 | 必须补齐才能上车 |
 
 三条功能里，**① 起点到终点** 和 **③ 路径点** 搬到真机主要是标定问题；
 **② 障碍物避让** 最麻烦，因为**"零接触"这个结论在真机上没法用现在的工具证明**（见第 4 节）。
+
+> **本次更新：底盘驱动层已经做完了。** 详见
+> [`acg720_protocol.md`](acg720_protocol.md)。要点：
+>
+> * `acg720_driver` 节点：`/cmd_vel` → 四轮 RPM，编码器计数 → `/odom` + `odom→base_link`
+> * `acg720_simulator`：PTY 虚拟底盘，**没有硬件也能把全链路跑通并验证**
+> * `robot.launch.py`：真机 bringup（驱动 + TF + Nav2，无 Gazebo、无仿真时钟）
+> * `urdf/acg720_real.urdf.xacro`：按交接包几何建的真车 URDF
+> * 测试：54 例纯函数 + 30 项 HIL + 20 项 launch 冒烟
+>
+> ⚠ **第一阻塞项**：交接包只给了帧头 `A5 5A` 和命令字，**没有给 payload 字节布局**。
+> 本工程自行定义了一套（集中在 `src/acg720_protocol.py` 一个文件里）。
+> 接真车前必须拿 FPGA 源码核对，否则底盘会按错误速度跑而日志一切正常。
+>
+> ⚠ **第二阻塞项**：雷达型号还没定。用户已确认会加 2D 雷达（LD19 / RPLIDAR A1 级），
+> 但具体型号、驱动包、安装位姿都还没有，所以 `robot.launch.py` 默认
+> `use_laser:=false` 且**不绑定任何雷达型号**。
 
 ---
 
@@ -90,31 +107,41 @@ Nav2、SLAM、地图、路点、参数文件全都在这一层之上，不依赖
 `robot_state_publisher` 继续用同一份 URDF（去掉 gz 插件和 sensor 之后），这样
 `base_link → laser_frame` 的几何关系不用重配。
 
-### 2.2 顺带要修的几处
+### 2.2 顺带要修的几处 —— ✅ 已改完
 
-读 `launch/nav.launch.py` 发现的、`sim:=false` 时会碍事的地方（**仅读代码得出，未实跑验证**）：
+原先读代码发现的、`sim:=false` 时会碍事的三处，**现在都已经改掉并验证过**：
 
-| 行 | 问题 | 建议改法 |
+| 位置 | 原问题 | 现在 |
 |---|---|---|
-| 194、224、262 | `use_sim_time` **三处硬编码 `'true'`** | 提成 launch 参数，跟随 `sim` |
-| 162-163 | 无条件检查 `worlds/<world>` 文件存在 | `sim_on` 时才检查 |
-| 138、282 | `world` 参数在非仿真下无意义 | 保留但跳过校验 |
+| `nav.launch.py` 194/224/262 | `use_sim_time` 三处硬编码 `'true'` | ✅ 提成独立 launch 参数 `use_sim_time`，留空时跟随 `sim`；仿真/真机/HIL 三种组合都能跑 |
+| `nav.launch.py` 162 | 无条件检查 `worlds/<world>` 是否存在 | ✅ 改成 `sim_on` 时才检查。真机上传 `world` 无意义，不该因此启动失败 |
+| `nav.launch.py` 138 | `world` 参数在非仿真下无意义 | ✅ 保留但跳过校验 |
 
-### 2.3 还需要一个新的 bringup launch
+**为什么 `use_sim_time` 必须跟 `sim` 分开**：真机上 `sim:=false` 只是"不启动
+Gazebo"，此时**没有 `/clock`**。如果 Nav2 仍开着 `use_sim_time=true`，它会一直等
+一个永远不来的时钟——症状是节点全起、TF 树完整、**车就是不动**，而且日志里
+几乎没有报错。这是最难现场排查的一类问题，所以现在默认值紧跟 `sim`。
 
-现在是三段式，真机上车需要一层把它们串起来：
+### 2.3 bringup launch —— ✅ 已实现
+
+`launch/robot.launch.py` 已经写好并跑通（`test_bringup_smoke.py` 用真实
+`ros2 launch` 验证）：
 
 ```
-现在：  gazebo_sim.launch.py   （仿真 + 桥）
-        slam.launch.py         （单独建图）
-        nav.launch.py          （Nav2，sim:= 可关仿真）
-
-要加：  robot.launch.py        （新增）
-          ├── 底盘驱动节点
-          ├── 雷达驱动节点
-          ├── robot_state_publisher（URDF 去掉 gz 插件）
-          └── nav.launch.py  sim:=false
+robot.launch.py
+  ├── acg720_driver            底盘驱动（串口 → /odom + odom→base_link）
+  ├── robot_state_publisher    URDF → base_link→laser_frame 等固定 TF
+  ├── 雷达驱动（use_laser:=true 时，本工程不绑定型号）
+  └── nav.launch.py sim:=false Nav2；use_sim_time 自动为 false
 ```
+
+用法与各参数见 [`acg720_protocol.md`](acg720_protocol.md) 第九节。
+
+> ⚠ **`odom → base_link` 只能有一个发布者。** 驱动节点发这条；URDF 里
+> **不能**再把它写成关节（真车 URDF 的根是 `base_link`，不是 `odom`）。
+> 两边都发会出现 `TF_REPEATED_DATA`，RViz 里车会抖。
+> 冒烟测试专门断言了 `/tf` 的发布者数量 ≤2（驱动 + robot_state_publisher，
+> 后者只在 `/tf_static` 上发固定关节）。
 
 ---
 
@@ -229,41 +256,81 @@ Nav2、SLAM、地图、路点、参数文件全都在这一层之上，不依赖
 
 ## 7. 文件改动总览
 
-真机落地时预计要动的文件：
+真机落地时预计要动的文件（**标 ✅ 的已经做完了**）：
 
-| 文件 | 动作 |
-|---|---|
-| `urdf/my_robot.urdf.xacro` | **改**：删 gz 插件与 sensor；按实测填 6 组 property |
-| `launch/robot.launch.py` | **新增**：驱动 + 雷达 + `robot_state_publisher` + `nav.launch.py sim:=false` |
-| `launch/nav.launch.py` | **改**：`use_sim_time` 提成参数（194/224/262 行）；world 校验加条件（162 行） |
-| `config/nav2_params.yaml` | **改**：`footprint`、`inflation_radius`、速度/加速度上限、AMCL 雷达参数 |
-| `config/slam_toolbox.yaml` | **改**：`max_laser_range`、`minimum_time_interval` |
-| `maps/*` | **替换**：真场地重新建图 |
-| `scripts/mapeval.py` | **改或新增**：现在依赖 world SDF，真机需要一个不依赖真值的替代口径 |
-| `scripts/obs_test.py` | **改或新增**：同上，真机版要接外部真值源 |
-| `docs/real_robot_params.md` | **填**：把占位值换成实测值 |
-| 新增 `scripts/` | 可能：外部真值（AprilTag / 动捕）的接入脚本 |
+| 文件 | 动作 | 状态 |
+|---|---|---|
+| `src/acg720_protocol.py` | **新增**：串口帧编解码 + 运动学换算口径 | ✅ 已做（payload 布局待核实） |
+| `src/drive_kinematics.py` | **新增**：Twist ↔ 四轮 RPM、计数 ↔ 位姿 | ✅ 已做 |
+| `src/acg720_driver.py` | **新增**：底盘驱动节点 | ✅ 已做 |
+| `src/acg720_simulator.py` | **新增**：PTY 虚拟底盘（无硬件验证） | ✅ 已做 |
+| `urdf/acg720_real.urdf.xacro` | **新增**：真车 URDF（无 gz 插件/sensor） | ✅ 已做，几何值待实车复核 |
+| `launch/robot.launch.py` | **新增**：真机 bringup | ✅ 已做 |
+| `launch/nav.launch.py` | `use_sim_time` 提成参数；world 校验加条件 | ✅ 已改 |
+| `test/`（三个文件） | **新增**：54 例单测 + 30 项 HIL + 20 项冒烟 | ✅ 已做 |
+| `docs/acg720_protocol.md` | **新增**：底盘驱动层文档 | ✅ 已做 |
+| `config/nav2_params.yaml` | **改**：`footprint`、`inflation_radius`、速度/加速度上限、AMCL 雷达参数 | ⏳ 待实车标定 |
+| `config/slam_toolbox.yaml` | **改**：`max_laser_range`、`minimum_time_interval` | ⏳ 待雷达型号确定 |
+| `maps/*` | **替换**：真场地重新建图 | ⏳ 待雷达 |
+| `scripts/mapeval.py` | **改或新增**：现在依赖 world SDF，真机需要不依赖真值的替代口径 | ⏳ 待第 4 节真值方案 |
+| `scripts/obs_test.py` | **改或新增**：同上，真机版要接外部真值源 | ⏳ 待第 4 节真值方案 |
+| `docs/real_robot_params.md` | **填**：把占位值换成实测值 | ⏳ 待实测 |
+| 新增 `scripts/` | 可能：外部真值（AprilTag / 动捕）的接入脚本 | ⏳ |
 
 **不需要改**：`cost_slice.py`、`nav_goals.py`、`routes/*`。
-`CMakeLists.txt` 的 install 列表也不用改——它已经是 `install(DIRECTORY ... docs scripts ...)`，
-覆盖了 `docs/` 和 `scripts/` 下的所有文件。
 
-⚠️ **但新增文件后必须重新 `colcon build --symlink-install`。** `install/` 里是**按文件**建的
+⚠️ **新增文件后必须重新 `colcon build --symlink-install`。** `install/` 里是**按文件**建的
 符号链接（`real_robot_plan.md -> .../src/.../docs/real_robot_plan.md`），不是整目录链接，
 所以 CMake 的 `DIRECTORY` 规则虽然涵盖了它，也要跑一次 build 才会生成链接。
 （本文档本身就撞过这个：写完 `ls install/.../docs/` 里没有，build 一次才出现。
 `real_robot_params.md` 开头也记了同一条。）
 
+⚠️ **还有一个更隐蔽的坑：`install(PROGRAMS)` 会照抄源码的权限位。**
+新增的 `acg720_driver.py` / `acg720_simulator.py` 如果源码没有 `+x`，
+装出来的符号链接也就没有 `+x`，`ros2 launch` 会直接报
+`executable 'acg720_driver.py' not found on the libexec directory`
+——**看起来像"文件没装进去"，实际是权限问题**。本项目真的踩过这一条。
+`test_bringup_smoke.py` 的第 0 步专门检查这个，别再手工排查。
+
 ---
 
 ## 8. 阻塞项：先确认硬件
 
-**下面这些没确认之前，第 2 节的驱动层没法动手**——因为 gz 插件换成什么节点，完全取决于硬件：
+原来这里列了五条"不确认就没法动手"的问题。**底盘驱动层现在做完了，所以这份清单
+要重写**——已经答掉的划掉，还挡路的留下。
 
-1. **底盘**：什么型号？有没有现成 ROS 驱动？还是只有电机 + 编码器要自己写？
-2. **编码器接口**：串口 / CAN / USB？协议文档有没有？
-3. **雷达**：什么型号？（RPLIDAR / Livox / 其他）驱动包是哪个？量程和视场角是多少？
-4. **算力平台**：车上是什么？（Jetson / 树莓派 / NUC）跑得动 Nav2 吗？
-5. **有没有外部真值设备**：动捕？还是需要自己搭 AprilTag（决定第 4 节走哪条路线）？
+### ✅ 已经能动手了（交接包已给出足够信息）
 
-把这五条确认了，才能给出「具体改哪个文件、加哪个节点、每步怎么验」的落地版本。
+* **底盘**：ACG720，四路电机 + 编码器，由 FPGA 做底层闭环。
+  上位机只要按串口协议发目标 RPM、收遥测即可。**不需要写电机 PID。**
+* **接口**：串口（帧头 `A5 5A`，115200），协议与驱动层见
+  [`acg720_protocol.md`](acg720_protocol.md)。
+
+### ⛔ 仍然挡路的
+
+1. **payload 字节布局没有权威来源。** 交接包只给了帧头、命令字和周期。
+   本工程自行定义了一套（集中在 `src/acg720_protocol.py`），但**必须拿 FPGA 源码
+   或协议文档核对后才能接真车**。这是**第一阻塞项**：布局不对的后果是底盘按错误
+   速度跑，而日志上一切正常。
+2. **雷达型号 / 驱动包 / 安装位姿都还没有。** 用户已确认会加 2D 雷达
+   （LD19 / RPLIDAR A1 级），但具体型号未定。`/scan` 是 SLAM 与 AMCL 的前提，
+   所以**没有它就无法验证①③两条功能**。
+   `robot.launch.py` 因此默认 `use_laser:=false` 且不绑定任何型号。
+3. **算力平台还没定。** 目前"用开发机直连"。最终要确认是
+   Jetson / 香橙派 5 Plus / NUC，以及 ROS 2 版本与内存是否够跑 Nav2。
+4. **有没有外部真值设备。** 动捕？还是自己搭 AprilTag（天花板相机 + 车顶标签）？
+   这决定第 4 节走哪条路线，也决定②"零接触"能不能被证明。
+
+### 优先级建议
+
+```
+① 核对 payload 布局（拿 FPGA 源码）      ← 不解决，接车就是盲跑
+② 定雷达型号 + 装好驱动，确认 /scan 出得来  ← 不解决，Nav2/SLAM 无从验证
+③ 底盘台架验证（架空车轮）：方向、急停、/odom 尺度
+     用 robot.launch.py nav:=false
+④ 轮子落地，按 real_robot_params.md 标定 wheel_separation_scale
+⑤ 再谈①②③三条功能的真机复现（需要第 4 节的真值方案）
+```
+
+**注意 ③④ 现在就能做**，不依赖 ①②：`robot.launch.py` 只起底盘和 TF，
+不碰雷达也不碰 Nav2。所以"往真机方向推进"的下一步并不被阻塞。
