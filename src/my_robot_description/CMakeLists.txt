@@ -20,6 +20,7 @@ install(PROGRAMS
   scripts/nav_goals.py
   scripts/cost_slice.py
   scripts/xwd2png.py
+  scripts/platform_check.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

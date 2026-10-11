@@ -41,6 +41,13 @@
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-pil</exec_depend>
 
+  <!-- 真机串口：acg720_driver.py / acg720_simulator.py 都要 import serial（pyserial）。
+       ★ 这一条曾经漏掉过，后果很隐蔽：x86 开发机上 pyserial 通常早就装了，
+         所以本地怎么测都没事；换到全新平台（如 RK3588）上跑 rosdep install
+         不会装它，驱动一起来就是 ModuleNotFoundError: No module named 'serial'。
+       ★ 本文件是 XML，注释里不允许出现连续两个减号，所以上面不写命令原文。 -->
+  <exec_depend>python3-serial</exec_depend>
+
   <!-- 文档里记录的工作流会用到的命令行工具：
        slam.md 遥控建图用 teleop_twist_keyboard，
        保存地图用 nav2_map_server 的 map_saver_cli（上面已列） -->
