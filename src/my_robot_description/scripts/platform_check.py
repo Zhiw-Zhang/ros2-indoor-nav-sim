@@ -139,7 +139,7 @@ def check_ros() -> None:
 
     if not distro and not ros2_bin:
         print(f'{BAD} 没检测到 ROS 2（ROS_DISTRO 未设置，也找不到 ros2 命令）')
-        print(f'     如果还没装，装法见 docs/rk3588_deploy.md')
+        print(f'     如果还没装，装法见 docker/README.md')
         hard('ROS 2 未安装或未 source')
         return
 
@@ -244,8 +244,19 @@ def check_serial_and_pty() -> None:
         gid = grp.getgrnam('dialout').gr_gid
     except KeyError:
         gid = None
-    user = os.environ.get('USER') or os.environ.get('LOGNAME') or '(未知)'
+
+    # 用户名可能取不到：容器里用 `--user uid:gid` 跑时没有对应的 passwd 记录，
+    # USER / LOGNAME 都是空的。取不到就显示数字 uid —— 打印 "(未知)" 毫无用处，
+    # 而且会把下面那句建议污染成 `sudo usermod -aG dialout (未知)`。
+    user = os.environ.get('USER') or os.environ.get('LOGNAME') or ''
+    if not user:
+        try:
+            import pwd
+            user = pwd.getpwuid(os.geteuid()).pw_name
+        except (ImportError, KeyError):
+            user = f'uid={os.geteuid()} gid={os.getgid()}'
     groups = os.getgroups()
+
     if os.geteuid() == 0:
         # ★ root 不受组权限限制，能直接打开串口。容器里默认就是 root，
         #   如果这里按普通用户那样判，会误报一条根本不存在的硬阻塞 ——
@@ -254,6 +265,25 @@ def check_serial_and_pty() -> None:
         print(f'     （若改用普通用户跑，需把它加进 dialout 组）')
     elif gid is not None and gid in groups:
         print(f'{OK} 当前用户 {user} 在 dialout 组')
+    elif gid is not None and in_container():
+        # ★ 容器里这一条**不能**按普通用户那样判成硬阻塞，两个原因：
+        #   1. 上面刚确认过：现在容器里一个串口设备都没有（没有 --device）。
+        #      没设备可开，此时"不在 dialout 组"阻塞不了任何事。
+        #   2. Docker 的 `--user uid:gid` **不继承宿主用户的附加组**。所以哪怕
+        #      宿主上已经 `usermod -aG dialout` 了，容器里照样不在组里。
+        #      这不是配置写错，是机制 —— 在宿主上 usermod 永远修不好它。
+        #      正确做法是在 docker run 时加 `--group-add dialout`。
+        #    所以分两种：真有设备 -> 警告（迟早会失败）；没设备 -> 纯提示。
+        if devs:
+            print(f'{WARN} 当前用户 {user} 不在 dialout 组，'
+                  f'而容器里有串口设备 —— 打开会 PermissionError')
+        else:
+            print(f'{INFO} 当前用户 {user} 不在 dialout 组'
+                  f'（容器里没有串口设备，暂时无影响）')
+        print(f'     注意：容器里 --user 不继承宿主附加组，'
+              f'宿主上 usermod 没用。')
+        print(f'     接硬件时改 docker/run.sh，加：'
+              f'--group-add dialout --device=/dev/ttyXXX')
     elif gid is not None:
         print(f'{BAD} 当前用户 {user} **不在** dialout 组 —— 打开串口会 PermissionError')
         print(f'     修: sudo usermod -aG dialout {user}  然后**重新登录**')
@@ -322,6 +352,27 @@ def check_boot_and_console() -> None:
 
 
 # ---------------------------------------------------------------- 6. CPU/内存
+def devicetree_text(path: str) -> str:
+    """读设备树里的字符串属性，失败返回 ''。
+
+    属性是 NUL 结尾（`model`）或 NUL 分隔（`compatible`），取第一段即可。
+
+    为什么需要它：aarch64 的 /proc/cpuinfo **没有** `model name` 这一行
+    （那是 x86 才有的字段），Rockchip 的 BSP 也常常不填 `Hardware`。
+    结果就是三个候选键全部落空，型号打印成 "(未知)" —— 在一台专门为了
+    确认"这到底是什么板子"才跑的脚本里，这是最不该出现的输出。
+    板卡/SoC 型号的权威来源是设备树，不是 /proc/cpuinfo。
+    """
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read(512)
+    except OSError:
+        return ''
+    if not raw:
+        return ''
+    return raw.split(b'\x00')[0].decode('utf-8', 'replace').strip()
+
+
 def check_hardware() -> None:
     section('6. CPU 与内存')
     cpuinfo = read_text('/proc/cpuinfo') or ''
@@ -338,8 +389,22 @@ def check_hardware() -> None:
         if fields.get(key):
             model = fields[key]
             break
+
+    # aarch64 走这两条：/sys 在容器里也是挂进来的（只读），所以容器里同样读得到。
+    dt_model = (devicetree_text('/sys/firmware/devicetree/base/model')
+                or devicetree_text('/proc/device-tree/model'))
+    dt_compat = (devicetree_text('/sys/firmware/devicetree/base/compatible')
+                 or devicetree_text('/proc/device-tree/compatible'))
+    if not model:
+        model = dt_model
+
     n = os.cpu_count()
     print(f'{INFO} CPU: {model or "(未知)"}')
+    if dt_compat:
+        # 例如 rockchip,rk3588 —— 这一行才是"确实是 RK3588"的硬证据
+        print(f'{INFO} 设备树 compatible: {dt_compat}')
+    if dt_model and dt_model != model:
+        print(f'{INFO} 板卡型号（设备树 model）: {dt_model}')
     print(f'{INFO} 逻辑核数: {n}')
 
     mem_gb = None
@@ -366,24 +431,61 @@ def check_hardware() -> None:
 
 
 # -------------------------------------------------------------------- 7. 网络
+def ipv4_addrs() -> list[tuple[str, str]]:
+    """非 lo 的 (网卡名, IPv4)。先试 `ip`，没有就纯 Python 兜底。
+
+    为什么要兜底：容器镜像里没装 iproute2（省依赖），`ip` 命令根本不存在。
+    而容器是用 `--network host` 起的，看到的网卡就是宿主的，信息一样有用 ——
+    正因如此，这里返回空的时候必须说清"是没网还是没工具"，否则会被误读成
+    "板子没联网"，然后去查一个不存在的问题。
+
+    兜底用 SIOCGIFADDR 这个老 ioctl，不依赖任何第三方库，也不需要 root。
+    """
+    out: list[tuple[str, str]] = []
+    try:
+        r = subprocess.run(['ip', '-4', '-o', 'addr'], capture_output=True,
+                           text=True, timeout=5)
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 4 and parts[1] != 'lo':
+                    out.append((parts[1], parts[3].split('/')[0]))
+            if out:
+                return out
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    import fcntl
+    import socket
+    import struct
+    for _, name in socket.if_nameindex():
+        if name == 'lo':
+            continue
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            res = fcntl.ioctl(s.fileno(), 0x8915,
+                              struct.pack('256s', name[:15].encode()))
+            out.append((name, socket.inet_ntoa(res[20:24])))
+        except OSError:
+            pass                      # 网卡没有 IPv4（没插网线 / 只有 v6）
+        finally:
+            s.close()
+    return out
+
+
 def check_network() -> None:
     section('7. 网络与跨机 DDS')
     # 列出非 lo 的 IPv4
-    addrs: list[str] = []
-    try:
-        out = subprocess.run(['ip', '-4', '-o', 'addr'], capture_output=True,
-                             text=True, timeout=5).stdout
-        for line in out.splitlines():
-            parts = line.split()
-            if len(parts) >= 4 and parts[1] != 'lo':
-                addrs.append(f'{parts[1]} {parts[3]}')
-    except (OSError, subprocess.SubprocessError):
-        pass
+    addrs = ipv4_addrs()
     if addrs:
-        for a in addrs:
-            print(f'{INFO} 网卡 {a}')
+        for name, ip in addrs:
+            print(f'{INFO} 网卡 {name} {ip}')
+    elif shutil.which('ip') is None:
+        print(f'{WARN} 读不到网卡 —— 容器里没装 ip 命令，'
+              f'这条是**工具缺失**，不代表没联网')
+        print(f'     想看结果：装 iproute2，或者在**宿主**上跑 ip -4 addr')
     else:
-        print(f'{WARN} 没读到非 lo 的 IPv4（ip 命令不可用？还是没联网？）')
+        print(f'{WARN} 没读到非 lo 的 IPv4 —— 板子可能真没联网/没插网线')
         print(f'     板子必须和开发机在同一网段，RViz 才能跨机看到数据')
 
     for var in ('ROS_DOMAIN_ID', 'RMW_IMPLEMENTATION',
