@@ -30,7 +30,13 @@ import subprocess
 import sys
 import time
 
-WS = '/home/zzw/sim_nav_ws'
+# 工作空间根目录**从本文件位置推**，不要写死绝对路径。
+# 本文件在 <WS>/src/my_robot_description/test/ 下，所以往上三级就是 <WS>。
+# ★ 这里原本写死的是开发机路径 /home/zzw/sim_nav_ws，搬到板子上直接失效：
+#   板子上仓库在 /home/orangepi/sim_nav_ws，容器里挂在 /ws。写死等于把测试
+#   绑死在一台机器上，而这正是"到真机平台再验一遍"最不该带的毛病。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+WS = os.path.abspath(os.path.join(_HERE, '..', '..', '..'))
 SRC = os.path.join(WS, 'src', 'my_robot_description', 'src')
 
 
