@@ -71,6 +71,23 @@ def read_text(path: str) -> str | None:
         return None
 
 
+def in_container() -> bool:
+    """是否跑在容器里（Docker / Podman）。
+
+    为什么要在意：容器**共用宿主内核**，所以
+      · /proc/cmdline 是宿主内核的（看 UART 控制台冲突仍然有意义）
+      · /boot 通常没挂载 -> 第 5 节的启动配置检查会"什么都没找到"
+      · /dev/ttyS* 是宿主的，可能一个都不透传进来
+    这些都是容器里的正常现象，不是故障。不点明的话很容易被误读成
+    "启动配置读不出来"然后去瞎折腾。
+    """
+    if os.path.exists('/.dockerenv') or os.path.exists('/run/.containerenv'):
+        return True
+    cgroup = read_text('/proc/1/cgroup') or ''
+    return any(k in cgroup for k in ('docker', 'containerd', 'kubepods',
+                                     'libpod'))
+
+
 # ---------------------------------------------------------------- 1. 系统与架构
 def check_os() -> None:
     section('1. 系统与架构')
@@ -106,6 +123,12 @@ def check_os() -> None:
         print(f'{WARN} 读不到发行版版本号，无法判断能否装 Jazzy')
 
     print(f'{INFO} Python: {platform.python_version()} ({sys.executable})')
+
+    if in_container():
+        print(f'{INFO} ★ 运行在**容器**里。容器共用宿主内核，所以：')
+        print(f'     · /proc/cmdline 是宿主内核的（看 UART 控制台冲突仍然有效）')
+        print(f'     · /boot 一般没挂载 -> 第 5 节会"找不到启动配置"，属正常')
+        print(f'     · /dev/ttyS* 是宿主的，没 --device 透传就看不到')
 
 
 # ------------------------------------------------------------------- 2. ROS 2
@@ -208,8 +231,12 @@ def check_serial_and_pty() -> None:
         print(f'{INFO} 真机用的是 USB 转串口（ttyUSB*/ttyACM*）还是板载 UART（ttyS*），')
         print(f'     取决于你实际怎么接线；ACG720 那侧波特率见 docs/real_robot_params.md')
     else:
-        print(f'{WARN} 没发现任何串口设备 —— 小车还没接？'
-              f'（接了的话插拔一下看 dmesg | tail）')
+        if in_container():
+            print(f'{INFO} 容器里没看到串口设备 —— 这是正常的。'
+                  f'接了硬件后要用 --device=/dev/ttyXXX 透传进来')
+        else:
+            print(f'{WARN} 没发现任何串口设备 —— 小车还没接？'
+                  f'（接了的话插拔一下看 dmesg | tail）')
 
     # --- dialout 组：不在里面就 open() 不了串口 ---
     import grp
@@ -219,7 +246,13 @@ def check_serial_and_pty() -> None:
         gid = None
     user = os.environ.get('USER') or os.environ.get('LOGNAME') or '(未知)'
     groups = os.getgroups()
-    if gid is not None and gid in groups:
+    if os.geteuid() == 0:
+        # ★ root 不受组权限限制，能直接打开串口。容器里默认就是 root，
+        #   如果这里按普通用户那样判，会误报一条根本不存在的硬阻塞 ——
+        #   而我们推荐的第一条路恰好就是"在容器里跑"，所以必须区分开。
+        print(f'{OK} 当前是 root（uid 0），不受 dialout 组限制，可直接打开串口')
+        print(f'     （若改用普通用户跑，需把它加进 dialout 组）')
+    elif gid is not None and gid in groups:
         print(f'{OK} 当前用户 {user} 在 dialout 组')
     elif gid is not None:
         print(f'{BAD} 当前用户 {user} **不在** dialout 组 —— 打开串口会 PermissionError')
@@ -259,7 +292,10 @@ def check_boot_and_console() -> None:
     ]
     found = [p for p in candidates if os.path.isfile(p)]
     if not found:
-        print(f'{WARN} 没找到已知的启动配置文件（可能路径不同/权限不足）')
+        if in_container():
+            print(f'{INFO} 容器里看不到宿主 /boot，这一项**跳过**（去宿主上查）')
+        else:
+            print(f'{WARN} 没找到已知的启动配置文件（可能路径不同/权限不足）')
     for p in found:
         txt = read_text(p)
         if txt is None:
