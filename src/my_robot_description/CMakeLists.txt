@@ -21,6 +21,7 @@ install(PROGRAMS
   scripts/cost_slice.py
   scripts/xwd2png.py
   scripts/platform_check.py
+  scripts/gen_real_params.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

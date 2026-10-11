@@ -78,6 +78,15 @@ def _launch_setup(context, *args, **kwargs):
     map_yaml = cfg.get('map', '')
     log_level = cfg.get('log_level', 'info')
 
+    # ★ 真车用的是**另一份** Nav2 参数，不是仿真那份。
+    #   真车 footprint 只有仿真的约一半（0.185 x 0.226 vs 0.40 x 0.37），
+    #   速度上限也低（0.20 vs 0.5 m/s）。用仿真参数的后果是：车被当成两倍大
+    #   （能过的门不走），且 Nav2 按 0.5 规划、驱动按 0.2 截断 ->
+    #   MPPI 持续欠跟踪、走走停停。**两种情况都不报错**。
+    #   这份文件由 scripts/gen_real_params.py 自动生成，不要手工编辑。
+    params_file = cfg.get('params_file', '') or os.path.join(
+        pkg_share, 'config', 'nav2_params_real.yaml')
+
     urdf_path = os.path.join(pkg_share, 'urdf', 'acg720_real.urdf.xacro')
     if not os.path.isfile(urdf_path):
         raise RuntimeError(f'找不到真车 URDF: {urdf_path}')
@@ -162,12 +171,20 @@ def _launch_setup(context, *args, **kwargs):
 
     # ---- 4. Nav2（sim:=false，所以 use_sim_time 也是 false）----
     if nav_on:
+        if not os.path.isfile(params_file):
+            raise RuntimeError(
+                f'找不到真车 Nav2 参数: {params_file}\n'
+                f'  这份文件是自动生成的，生成命令：\n'
+                f'    ros2 run my_robot_description gen_real_params.py\n'
+                f'  若确实要用别的参数文件，用 params_file:=<绝对路径> 覆盖。')
         nav_args = {
             'sim': 'false',
             # 显式再传一次：真机没有 /clock
             'use_sim_time': 'false',
             'rviz': 'true' if str(rviz_on).lower() in ('true', '1') else 'false',
             'log_level': log_level,
+            # ★ 必须是真车参数。漏传就会静默退回仿真参数，见上面那段注释。
+            'params_file': params_file,
         }
         if map_yaml:
             nav_args['map'] = map_yaml
@@ -229,6 +246,11 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'cmd_vel_timeout', default_value='0.5',
             description='/cmd_vel 超时停车时间 s'),
+        DeclareLaunchArgument(
+            'params_file', default_value='',
+            description='Nav2 参数文件。默认用**真车**参数 '
+                        'config/nav2_params_real.yaml（不是仿真的 nav2_params.yaml，'
+                        '两者几何与限幅差一倍）。该文件由 gen_real_params.py 生成'),
         DeclareLaunchArgument(
             'map', default_value='', description='地图 yaml 绝对路径'),
         DeclareLaunchArgument(
