@@ -107,21 +107,31 @@ ros2 launch my_robot_description nav.launch.py map:=/abs/path/other.yaml
 
 ```
 sim_nav_ws/
+├── docker/                        ★ 板子上跑 Jazzy 的容器入口（见 docker/README.md）
+│   ├── Dockerfile                 镜像定义（Noble + Jazzy；不含源码）
+│   ├── run.sh                     构建 / 进容器 / 在容器里跑一条命令
+│   └── README.md                  为什么用容器、怎么用、以后怎么接串口
 └── src/my_robot_description/
-    ├── urdf/my_robot.urdf.xacro   机器人模型 + gz 插件（差速驱动、雷达）
-    │                              ★ 顶部 30~90 行是 6 组待标定的 property
+    ├── urdf/
+    │   ├── my_robot.urdf.xacro    仿真模型 + gz 插件（差速驱动、雷达）
+    │   │                          ★ 顶部 30~90 行是 6 组待标定的 property
+    │   └── acg720_real.urdf.xacro 真车模型（按交接包几何填，**未实测**）
     ├── launch/
     │   ├── gazebo_sim.launch.py   仿真 + ros_gz 桥（含 WSL 渲染适配）
     │   ├── nav.launch.py          Nav2（sim:= 可关仿真）
-    │   └── slam.launch.py         建图
+    │   ├── slam.launch.py         建图
+    │   └── robot.launch.py        真车 bringup（底盘驱动 + 可选 Nav2）
     ├── config/
-    │   ├── nav2_params.yaml       Nav2 全部参数（改过的地方标了 ★）
+    │   ├── nav2_params.yaml       Nav2 仿真参数（改过的地方标了 ★）
+    │   ├── nav2_params_real.yaml  Nav2 真车参数（★ 由脚本生成，别手改）
     │   ├── slam_toolbox.yaml      SLAM 参数（两处必改的写了注释）
     │   └── *.rviz                 三个 RViz 配置
+    ├── src/                       真机协议 / 运动学 / 驱动 / 虚拟底盘
+    ├── test/                      单测 + HIL 集成测试 + launch 冒烟测试
     ├── worlds/                    三个场景（见下表）
     ├── maps/                      三张地图，与 worlds 一一对应
     ├── routes/                    路点文件（供 nav_goals.py 使用）
-    ├── scripts/                   五个验收工具（见 docs/tools.md）
+    ├── scripts/                   验收工具 + platform_check.py + gen_real_params.py
     └── docs/                      ★ 文档入口：docs/README.md
 ```
 
@@ -156,6 +166,7 @@ ros2 launch my_robot_description nav.launch.py world:=rooms_obstacles.sdf \
 | [tools.md](src/my_robot_description/docs/tools.md) | 五个验收脚本 |
 | [real_robot_plan.md](src/my_robot_description/docs/real_robot_plan.md) | **实车迁移计划** |
 | [real_robot_params.md](src/my_robot_description/docs/real_robot_params.md) | **实车参数标定手册** |
+| [docker/README.md](docker/README.md) | **在 RK3588 板子上用容器跑**（宿主 22.04 → 容器里的 Jazzy） |
 
 ---
 
@@ -181,6 +192,22 @@ ros2 launch my_robot_description robot.launch.py port:=/dev/pts/N nav:=false
 细节见 [`acg720_protocol.md`](src/my_robot_description/docs/acg720_protocol.md)。
 验证规模：**54 例纯函数单测 + 30 项 HIL 集成测试 + 20 项 launch 冒烟测试**，
 含 skid-steer 标定闭环（`θ_odom/θ_true` 从 1.361 收到 1.005）。
+
+### 板子上怎么跑：Ubuntu 22.04 + 容器
+
+算力平台是 **Orange Pi 5 Plus**（RK3588，aarch64，8 GB 级）。官方镜像是
+**Ubuntu 22.04**，而 ROS 2 Jazzy 只出 Noble（24.04）的二进制包，所以
+**宿主不变，Jazzy 放进容器**：
+
+```bash
+cd ~/sim_nav_ws
+docker/run.sh --build                            # 构建镜像，只做一次
+docker/run.sh ros2 run my_robot_description platform_check.py
+```
+
+镜像里**不放源码**，仓库是运行时挂载进去的，改代码不用重建镜像。理由、
+验证顺序、已知坑（`--user`、`--ipc host`、以后怎么接底盘串口）都在
+[`docker/README.md`](docker/README.md)。
 
 ### 还差的两块
 
