@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""虚拟 ACG720 底盘：让 ROS 2 侧在**没有硬件**的情况下端到端跑通。
+# -*- coding: utf-8 -*-
+"""虚拟 ACG720 底盘：把 `Acg720Firmware` 接到 PTY 上，没有硬件也能端到端跑通。
 
 它做什么
 --------
@@ -12,29 +13,19 @@
 
     ✅ 帧编解码 / CRC / 流式重新同步（走真字节流和真分帧逻辑）
     ✅ 驱动的串口打开、读写、断线重连路径
-    ✅ /cmd_vel → 四轮 RPM → /odom + TF 全链路，含命令超时停车
+    ✅ /cmd_vel → MOVE → /odom + TF 全链路，含命令超时停车
     ✅ 运动学符号与尺度（原地转往哪边、scale 怎么影响转角）
-    ✅ 真车已知的两个坑：7 RPM 低速走不动、skid 侧滑
+    ✅ 真固件会咬人的那些行为：非法帧锁死、ACK 单槽、3.0 s 上限、故障自锁
 
     ❌ 不验证：电气、真实电机响应、真实编码器、真实轮胎摩擦、EMI。
        这些只有上车才知道，本文件不去假装。
 
-刻意复刻真车的已知缺陷（依据 = 交接包 F1 验收报告）
---------------------------------------------------
-1. **内轮目标低于约 7 RPM 时无法稳定跟踪**，轮子以约 7 RPM 滑行
-   → `tracking_floor_rpm`（默认 7.0）。
-   整个避障减速段都落在这个区间，所以这个缺陷会直接影响真机行为，
-   必须在没硬件时就暴露出来，而不是上了车才发现"让它慢慢挪它却冲出去"。
-
-2. **skid-steer 侧滑**：车体实际转角小于差速模型预测
-   → `ground_truth_separation_scale`（默认 1.36）代表"真实车体"的有效轮距。
-   驱动侧默认 1.0，所以**默认配置下就能看到"命令转 1 圈、车实际只转 0.73 圈"**；
-   把驱动的 scale 标到 1.36，误差就被收掉了 —— 这正是真机要走的标定流程。
-
-3. **FPGA 拒绝 > 200 RPM 的目标**（交接包 4.3 节）
-   → `max_target_rpm`；被拒时回 0x83 状态帧带拒绝码，驱动会打 WARN。
-
-4. **心跳 300 ms 超时进安全态**（交接包 4.4 节）→ `heartbeat_timeout`。
+与上一版的区别
+--------------
+上一版里"虚拟车"是本项目**自己设计**的行为模型，而且说的是自己发明的协议。
+现在：**协议**由 `acg720_protocol_v1.py` 给出（与厂商实现逐字节交叉核对），
+**行为**由 `acg720_firmware.py` 给出（按 RTL 逐条复刻）。
+本文件退化成一层薄适配：PTY ↔ 模型，外加真值位姿发布。
 
 用法
 ----
@@ -44,8 +35,8 @@
     # 只起虚拟车，打印 /dev/pts/N，自己手动把驱动指过去
     ros2 run my_robot_description acg720_simulator --no-driver
 
-    # 干跑（不连 ROS，只验证 PTY + 协议）
-    python3 src/my_robot_description/src/acg720_simulator.py --no-driver --dry-run
+    # 自检（不连 ROS，验证 PTY 双向通道 + 协议 + 固件的危险行为）
+    python3 src/my_robot_description/src/acg720_simulator.py --dry-run
 """
 
 from __future__ import annotations
@@ -54,12 +45,10 @@ import argparse
 import math
 import os
 import select
-import struct
 import sys
 import termios
 import time
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import rclpy
 from rclpy.node import Node
@@ -67,11 +56,12 @@ from std_msgs.msg import String
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from acg720_protocol import (  # noqa: E402
-    Cmd, Flag, Frame, FrameParser, PositionDone, Status, Telemetry,
-    encode, lr_to_wheels, pack_position_done, pack_status, pack_telemetry,
-    parse_heartbeat, parse_position, parse_status, parse_telemetry,
-    parse_velocity, parse_position_done, wheels_to_lr,
+from acg720_firmware import (  # noqa: E402
+    Acg720Firmware, FirmwareParams, SafetyState, FaultReason,
+)
+from acg720_protocol_v1 import (  # noqa: E402
+    Kind, FrameParser, SequenceTracker, encode_command, pack_move, pack_position,
+    parse_diagnostic, parse_position_telemetry,
 )
 
 
@@ -159,269 +149,99 @@ class PtySerial:
                 pass
 
 
-@dataclass
-class WheelState:
-    """单个轮子的状态。"""
-    position_counts: float = 0.0     # 累计计数（物理真值，浮点，上报时取整）
-    rpm: float = 0.0                 # 当前实际转速
-    #: 上一次已上报的累计计数。上报的是**区间增量**，所以要对齐。
-    reported_counts: float = field(default=0.0, repr=False)
+class Acg720SimulatorNode(Node):
+    """把 `Acg720Firmware` 接到 PTY 和 ROS 上。
 
-
-class VirtualAcg720:
-    """ACG720 的行为模型。
-
-    时间推进由外部按固定步长调用 `step(dt)`，这样物理是确定性的：
-    同样的指令序列一定得到同样的计数和位姿，测试才不会 flaky。
+    节点本身**不做任何协议/安全决策** —— 发什么帧、什么时候发，全部由固件模型
+    决定。这一层只负责搬字节、记日志、发真值位姿。这样"虚拟车的行为"
+    就只有唯一一处定义（`acg720_firmware.py`），不会被节点里的定时器带偏。
     """
 
-    def __init__(self,
-                 wheel_radius_m: float = 0.0325,
-                 counts_per_rev: float = 1320.0,
-                 tracking_floor_rpm: float = 7.0,
-                 max_target_rpm: float = 200.0,
-                 ground_truth_separation_m: float = 0.200,
-                 ground_truth_separation_scale: float = 1.36,
-                 motor_time_constant_s: float = 0.12,
-                 heartbeat_timeout_s: float = 0.30,
-                 telemetry_period_s: float = 0.05,
-                 seed: int = 0):
-        self.wheel_radius_m = wheel_radius_m
-        self.counts_per_rev = counts_per_rev
-        self.tracking_floor_rpm = tracking_floor_rpm
-        self.max_target_rpm = max_target_rpm
-        self.heartbeat_timeout_s = heartbeat_timeout_s
-        self.telemetry_period_s = telemetry_period_s
-        self.motor_tau = motor_time_constant_s
-
-        #: "真实车体"的有效轮距。物理上决定车实际转多快。
-        #: 它和驱动侧用的 b_eff 不一样时，就能看到转角误差 —— 这就是标定的意义。
-        self.gt_separation = ground_truth_separation_m * ground_truth_separation_scale
-
-        # 四个轮子：A=右前 B=左前 C=左后 D=右后（交接包的轮位约定）
-        self.wheels = [WheelState() for _ in range(4)]
-        self.target_rpm = [0.0, 0.0, 0.0, 0.0]
-
-        # 车体真实位姿（虚拟车里存在，真机上不存在）
-        self.x = 0.0
-        self.y = 0.0
-        self.yaw = 0.0
-
-        self.flags = 0
-        self.uptime_s = 0.0
-        self.seq = 0
-        self.last_heartbeat_s = -1e9
-        self.reject_code = 0
-        self.accepted = True
-
-        # 卡死检测：duty 饱和且实测 <=3 RPM 连续 10 个采样
-        self._stall_samples = 0
-        self._duty = [0, 0, 0, 0]
-        self._last_reject_reason = 0
-
-    # ---------------- 上报 ----------------
-
-    @property
-    def counts_per_meter(self) -> float:
-        return self.counts_per_rev / (2.0 * math.pi * self.wheel_radius_m)
-
-    @property
-    def rpm_to_mps(self) -> float:
-        return 2.0 * math.pi * self.wheel_radius_m / 60.0
-
-    def left_right_rpm(self) -> Tuple[float, float]:
-        return wheels_to_lr(*self.wheels_rpm())
-
-    def wheels_rpm(self) -> Tuple[float, float, float, float]:
-        return tuple(w.rpm for w in self.wheels)
-
-    def make_telemetry(self) -> Telemetry:
-        """组一帧 0x84。counts 是**本采样区间的增量**（带符号）。"""
-        counts = []
-        for w in self.wheels:
-            delta = int(round(w.position_counts - w.reported_counts))
-            w.reported_counts += delta
-            counts.append(delta)
-        rpm = tuple(int(round(w.rpm)) for w in self.wheels)
-        return Telemetry(seq=self.seq, uptime_ms=int(self.uptime_s * 1000.0),
-                         counts=tuple(counts), rpm=rpm,
-                         duty=tuple(self._duty), flags=self.flags)
-
-    def make_status(self, heartbeat_echo: int) -> Status:
-        return Status(heartbeat_echo=heartbeat_echo, accepted=self.accepted,
-                      reject_code=self.reject_code,
-                      uptime_ms=int(self.uptime_s * 1000.0))
-
-    # ---------------- 下行命令 ----------------
-
-    def apply_velocity(self, payload: bytes) -> None:
-        cmd = parse_velocity(payload)
-        self.accepted = True
-        self.reject_code = 0
-        # 复刻 FPGA 的保护：目标超限直接拒（交接包 4.3 节，>200 RPM 判故障）
-        for v in cmd.rpm:
-            if abs(v) > self.max_target_rpm:
-                self.accepted = False
-                self.reject_code = 1        # TARGET_GT_200RPM
-                self.flags |= Flag.TARGET_REJECT
-                return
-        self.target_rpm = [float(v) for v in cmd.rpm]
-        self.flags &= ~Flag.TARGET_REJECT
-
-    def apply_position(self, payload: bytes) -> None:
-        cmd = parse_position(payload)
-        # 位置环在本模型里不做闭环，只记录 + 立刻回报"被新命令打断"，
-        # 免得假装验证了一个还没实现的环。
-        self._pending_position = cmd
-
-    def note_heartbeat(self, payload: bytes) -> int:
-        seq = parse_heartbeat(payload)
-        self.last_heartbeat_s = self.uptime_s
-        self.flags &= ~Flag.HEARTBEAT_TIMEOUT
-        return seq
-
-    # ---------------- 物理推进 ----------------
-
-    def step(self, dt: float) -> None:
-        self.uptime_s += dt
-
-        # 心跳超时 → 安全态（交接包 4.4 节：300 ms）
-        if (self.uptime_s - self.last_heartbeat_s) > self.heartbeat_timeout_s:
-            self.flags |= Flag.HEARTBEAT_TIMEOUT
-            self.target_rpm = [0.0, 0.0, 0.0, 0.0]
-
-        commanded_mags = [abs(v) for v in self.target_rpm if abs(v) > 1e-9]
-
-        for i, w in enumerate(self.wheels):
-            tgt = self.target_rpm[i]
-
-            # ★ 低速跟踪下限：非零但小于下限的目标，车实际以"下限"滑行。
-            #   这不是 bug，是交接包 F1 验收里实测到的真实行为。
-            if 1e-9 < abs(tgt) < self.tracking_floor_rpm:
-                effective = math.copysign(self.tracking_floor_rpm, tgt)
-                self.flags |= Flag.LOW_SPEED_WARN
-            else:
-                effective = tgt
-
-            # 一阶电机响应：τ 约 120 ms（拍值，真机待实测）
-            alpha = 1.0 - math.exp(-dt / self.motor_tau) if self.motor_tau > 0 else 1.0
-            w.rpm += (effective - w.rpm) * alpha
-            if abs(w.rpm) < 1e-6:
-                w.rpm = 0.0
-
-            # duty 近似：前馈零点约 150 + 斜率，上限 2700（54%）
-            self._duty[i] = int(min(2700, max(0, 150 + abs(w.rpm) * 12.0)))
-
-        # 低速警告旗标是"瞬时"的，本采样没有低速目标就清掉
-        if not any(1e-9 < m < self.tracking_floor_rpm for m in commanded_mags):
-            self.flags &= ~Flag.LOW_SPEED_WARN
-
-        # 卡死：duty 饱和 + 实测几乎不转
-        if all(d >= 1800 for d in self._duty) and all(abs(w.rpm) <= 3.0 for w in self.wheels):
-            self._stall_samples += 1
-        else:
-            self._stall_samples = 0
-        if self._stall_samples >= 10:
-            self.flags |= Flag.STALL
-
-        # --- 编码器计数 ---
-        for w in self.wheels:
-            w.position_counts += w.rpm * self.counts_per_rev / 60.0 * dt
-
-        # --- 车体真实位姿：用"真实有效轮距"，所以会体现侧滑 ---
-        left_rpm, right_rpm = self.left_right_rpm()
-        v_l = left_rpm * self.rpm_to_mps
-        v_r = right_rpm * self.rpm_to_mps
-        v = (v_l + v_r) / 2.0
-        omega = (v_r - v_l) / self.gt_separation          # ★ 真值侧滑在这里
-        yaw_mid = self.yaw + omega * dt / 2.0
-        self.x += v * math.cos(yaw_mid) * dt
-        self.y += v * math.sin(yaw_mid) * dt
-        self.yaw = (self.yaw + omega * dt + math.pi) % (2.0 * math.pi) - math.pi
-        self.seq = (self.seq + 1) & 0xFFFFFFFF
-
-
-class Acg720SimulatorNode(Node):
-    """把 VirtualAcg720 接到 PTY 和 ROS 上。"""
-
-    def __init__(self, pty: PtySerial, *, physics_rate_hz: float = 50.0,
-                 telemetry_rate_hz: float = 20.0, **model_kwargs):
+    def __init__(self, pty: PtySerial, params: FirmwareParams,
+                 physics_rate_hz: float = 100.0):
         super().__init__("acg720_simulator")
         self.pty = pty
-        self.model = VirtualAcg720(**model_kwargs)
-        self.parser = FrameParser()
-        self.physics_dt = 1.0 / physics_rate_hz
-        self.telemetry_period = 1.0 / telemetry_rate_hz
-        self._since_telemetry = 0.0
-        self._last_heartbeat_echo = 0
-        self._frames_in = 0
-        self._bad_frames = 0
+        self.fw = Acg720Firmware(params)
+        self.dt = 1.0 / physics_rate_hz
+        self._last_fault: Optional[FaultReason] = None
         self._last_log = 0.0
+        self._frames_in = 0
+        self._rx_parser = FrameParser()      # 只为了统计"收到了多少帧"
 
         self.truth_pub = self.create_publisher(String, "acg720_sim/ground_truth", 10)
-        self.create_timer(self.physics_dt, self._tick)
+        self.create_timer(self.dt, self._tick)
 
         self.get_logger().info(
-            f"虚拟 ACG720 已启动，PTY slave = {pty.slave_path}\n"
-            f"  轮径 {self.model.wheel_radius_m*1000:.1f} mm  "
-            f"CPR {self.model.counts_per_rev:.0f}  "
-            f"低速下限 {self.model.tracking_floor_rpm} RPM\n"
-            f"  真值有效轮距 {self.model.gt_separation:.4f} m "
-            f"(= 几何 {model_kwargs.get('ground_truth_separation_m', 0.2)} m × "
-            f"scale {model_kwargs.get('ground_truth_separation_scale', 1.36)})\n"
+            f"虚拟 ACG720 已启动（按 RTL 复刻的真固件模型），PTY slave = {pty.slave_path}\n"
+            f"  轮径 {params.wheel_radius_m*1000:.1f} mm  CPR {params.counts_per_rev:.0f}  "
+            f"低速下限 {params.tracking_floor_rpm} RPM\n"
+            f"  ★ 3.0 s 连续运动上限：{params.run_limit_s}s（会锁存 FAULT_RUN_LIMIT，"
+            f"只有复位能解）\n"
+            f"  ★ 300 ms 命令超时：{params.command_timeout_s}s\n"
+            f"  真值有效轮距 {params.ground_truth_separation_m:.4f} m "
+            f"(= 几何 {params.geometry_separation_m} m × "
+            f"scale {params.ground_truth_separation_scale})\n"
             f"  把这行喂给驱动节点：--ros-args -p port:={pty.slave_path}"
         )
 
+    # ------------------------------------------------------------------
+
     def _tick(self) -> None:
-        # 1) 收下行帧
+        # 1) 收下行字节 → 固件模型
         data = self.pty.read()
         if data:
-            for frame in self.parser.feed(data):
-                self._frames_in += 1
-                try:
-                    self._dispatch(frame)
-                except ValueError as exc:
-                    self._bad_frames += 1
-                    self.get_logger().warn(f"下行帧解析失败：{exc}")
+            self._frames_in += len(self._rx_parser.feed(data))
+            for event in self.fw.feed(data):
+                if event not in ('accepted',):
+                    self.get_logger().warn(
+                        f"固件接收侧事件：{event}（crc_errors={self.fw.rx.crc_errors} "
+                        f"duplicates={self.fw.rx.duplicates} "
+                        f"frame_errors={self.fw.rx.frame_errors}）",
+                        throttle_duration_sec=1.0)
 
-        # 2) 推进物理
-        self.model.step(self.physics_dt)
+        # 2) 推进固件模型，取回本该发出去的字节
+        out = self.fw.tick(self.dt) + self.fw.drain_tx()
+        if out:
+            self.pty.write(out)
 
-        # 3) 按 20 Hz 上报遥测
-        self._since_telemetry += self.physics_dt
-        if self._since_telemetry >= self.telemetry_period:
-            self._since_telemetry = 0.0
-            self.pty.write(encode(Cmd.TELEMETRY, pack_telemetry(self.model.make_telemetry())))
-            self.pty.write(encode(Cmd.STATUS,
-                                  pack_status(self.model.make_status(self._last_heartbeat_echo))))
+        # 3) 故障要**吵**。锁存 FAULT 之后车不会动了，现场必须一眼看出来
+        fault = self.fw.fault
+        if self.fw.state == SafetyState.FAULT and fault != self._last_fault:
+            self.get_logger().error(
+                f"★ 虚拟底盘已锁死：{fault.name}（{fault_name_cn(fault)}）。"
+                f"真机上这只能靠复位解除 —— 驱动不该再发运动命令。")
+        self._last_fault = fault if self.fw.state == SafetyState.FAULT else None
 
         # 4) 周期性把"真值"打出来。真机上没有这个东西，
-        #    但它是**标定 scale 的依据**，所以虚拟车必须提供。
-        now = self.model.uptime_s
+        #    但它是**标定 scale** 的依据，所以虚拟车必须提供。
+        now = self.fw.t
         if now - self._last_log >= 1.0:
             self._last_log = now
-            l_rpm, r_rpm = self.model.left_right_rpm()
+            p = self.fw.plant
             self.truth_pub.publish(String(data=(
-                f"t={now:.1f}s pos=({self.model.x:.3f},{self.model.y:.3f}) "
-                f"yaw={math.degrees(self.model.yaw):+.1f}deg "
-                f"wheels_rpm=({self.model.wheels[0].rpm:.1f},{self.model.wheels[1].rpm:.1f},"
-                f"{self.model.wheels[2].rpm:.1f},{self.model.wheels[3].rpm:.1f}) "
-                f"L={l_rpm:.1f} R={r_rpm:.1f} flags=0x{self.model.flags:04X} "
+                f"t={now:.1f}s pos=({p.x:.3f},{p.y:.3f}) "
+                f"yaw={math.degrees(p.yaw):+.1f}deg "
+                f"state={self.fw.state.name} fault={self.fw.fault.name} "
+                f"counts={p.position_counts} rpm={p.measured_rpm} "
                 f"frames_in={self._frames_in}"
             )))
 
-    def _dispatch(self, frame: Frame) -> None:
-        if frame.cmd == Cmd.SET_VELOCITY:
-            self.model.apply_velocity(frame.payload)
-        elif frame.cmd == Cmd.HEARTBEAT:
-            self._last_heartbeat_echo = self.model.note_heartbeat(frame.payload)
-        elif frame.cmd == Cmd.POSITION:
-            self.model.apply_position(frame.payload)
-            done = PositionDone(mode=0, success=False, reason=3,   # PREEMPTED
-                                final_counts=0, elapsed_samples=0)
-            self.pty.write(encode(Cmd.POSITION_DONE, pack_position_done(done)))
-        else:
-            self.get_logger().warn(f"虚拟车收到未知命令字 0x{frame.cmd:02X}")
+
+#: 故障码的中文名。真机现场看到 FAULT 时必须立刻知道"下一步该干什么"，
+#: 所以这里连"怎么恢复"一起说清楚。
+_FAULT_CN = {
+    FaultReason.NONE: "无",
+    FaultReason.ESTOP: "急停被按下（松开 S0 后按 S4 复位）",
+    FaultReason.MOTOR: "电机通道故障",
+    FaultReason.PROTOCOL: "协议故障 —— 有一帧被判定非法（CRC/版本/长度/语义）",
+    FaultReason.TIMEOUT: "命令超时 —— 超过 300 ms 没有收到有效命令",
+    FaultReason.RUN_LIMIT: ("连续运动超过 3.0 s 上限 —— 这是当前固件的已知限制，"
+                            "不是主机 bug；需要 FPGA 变更才能连续导航"),
+}
+
+
+def fault_name_cn(fault: FaultReason) -> str:
+    return _FAULT_CN.get(fault, "未知")
 
 
 # ==========================================================================
@@ -429,25 +249,46 @@ class Acg720SimulatorNode(Node):
 # ==========================================================================
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="虚拟 ACG720 底盘（PTY + 协议模型）")
+    p = argparse.ArgumentParser(description="虚拟 ACG720 底盘（PTY + 真固件行为模型）")
     p.add_argument("--no-driver", action="store_true",
                    help="只起虚拟车，不自动拉起驱动节点")
     p.add_argument("--dry-run", action="store_true",
-                   help="不初始化 ROS，只建 PTY 并打印路径（用来隔离排查）")
-    p.add_argument("--port", default=None,
-                   help="复用已存在的 PTY slave（调试用）")
-    p.add_argument("--physics-rate", type=float, default=50.0)
-    p.add_argument("--telemetry-rate", type=float, default=20.0)
-    p.add_argument("--tracking-floor-rpm", type=float, default=7.0,
-                   help="复刻真车低速下限（交接包 F1 实测约 7 RPM）")
-    p.add_argument("--gt-scale", type=float, default=1.36,
-                   help="真值侧滑系数，即仿真真车的有效轮距倍率")
-    p.add_argument("--gt-separation", type=float, default=0.200)
+                   help="不初始化 ROS，只建 PTY 并自检（用来隔离排查）")
+    p.add_argument("--port", default=None, help="复用已存在的 PTY slave（调试用）")
+    p.add_argument("--physics-rate", type=float, default=100.0,
+                   help="虚拟车内部推进频率；100 Hz 与真固件的 50 ms 采样配合良好")
+    p.add_argument("--baudrate", type=int, default=115200)
     p.add_argument("--counts-per-rev", type=float, default=1320.0)
     p.add_argument("--wheel-radius", type=float, default=0.0325)
+    p.add_argument("--tracking-floor-rpm", type=float, default=7.0,
+                   help="复刻真车低速下限（交接包 F1 实测约 7 RPM）")
+    p.add_argument("--gt-scale", type=float, default=1.0,
+                   help="真值侧滑系数。1.0=无侧滑；标定实验里可调大以复现"
+                        "'命令转 1 圈、车只转 0.73 圈'")
+    p.add_argument("--gt-separation", type=float, default=0.200)
+    p.add_argument("--run-limit-s", type=float, default=3.0,
+                   help="★ 只给测试放宽用；默认就是固件真值 3.0 s。"
+                        "在这里放宽等于把要验证的那条限制关掉")
+    p.add_argument("--command-timeout-s", type=float, default=0.3)
+    p.add_argument("--imu-available", action="store_true",
+                   help="默认没有 IMU：0x82 会照发但 flags 报 stale，不伪造数据")
     p.add_argument("--seconds", type=float, default=0.0,
                    help="dry-run 模式下跑多少秒后退出（0=一直跑）")
     return p.parse_args(argv)
+
+
+def _params_from_args(args) -> FirmwareParams:
+    return FirmwareParams(
+        baudrate=args.baudrate,
+        counts_per_rev=args.counts_per_rev,
+        wheel_radius_m=args.wheel_radius,
+        geometry_separation_m=args.gt_separation,
+        ground_truth_separation_scale=args.gt_scale,
+        tracking_floor_rpm=args.tracking_floor_rpm,
+        run_limit_s=args.run_limit_s,
+        command_timeout_s=args.command_timeout_s,
+        imu_available=args.imu_available,
+    )
 
 
 def main(argv=None) -> int:
@@ -457,122 +298,13 @@ def main(argv=None) -> int:
     print(f"[虚拟 ACG720] PTY slave 路径：{pty.slave_path}")
 
     if args.dry_run:
-        # 不依赖 ROS 的最小通道自检：
-        #   ① master 写 → slave 读   （遥测方向：虚拟车 → 驱动）
-        #   ② slave 写 → master 读   （命令方向：驱动 → 虚拟车）
-        # 两个方向都要过，才能真正证明 PTY 通道可用。
-        print("[dry-run] 不初始化 ROS，验证 PTY 双向通道 + 协议编解码…")
-        parser = FrameParser()
-        model = VirtualAcg720(
-            wheel_radius_m=args.wheel_radius,
-            counts_per_rev=args.counts_per_rev,
-            tracking_floor_rpm=args.tracking_floor_rpm,
-            ground_truth_separation_m=args.gt_separation,
-            ground_truth_separation_scale=args.gt_scale,
-        )
-        failures = 0
-
-        # ---- 方向 ①：虚拟车 → 驱动（遥测 + 状态）----
-        for i in range(3):
-            model.step(0.05)
-            sent = encode(Cmd.TELEMETRY, pack_telemetry(model.make_telemetry()))
-            pty.write(sent)
-        got = pty.read_from_slave(timeout=1.0)
-        if not got:
-            print("  ✗ 方向① 失败：往 master 写了遥测，slave 端一个字节都没收到")
-            failures += 1
-        else:
-            frames = parser.feed(got)
-            tele = [f for f in frames if f.cmd == Cmd.TELEMETRY]
-            if len(tele) != 3:
-                print(f"  ✗ 方向① 失败：期望 3 帧遥测，实收 {len(tele)} 帧")
-                failures += 1
-            else:
-                print(f"  ✓ 方向① 虚拟车→驱动：{len(tele)} 帧遥测，"
-                      f"{len(got)} 字节，最后一帧 "
-                      f"counts={parse_telemetry(tele[-1].payload).counts}")
-
-        # ---- 方向 ②：驱动 → 虚拟车（速度命令）----
-        #   ★ 这一行必须是 write_to_slave（扮演驱动），不能是 pty.write（那是虚拟车）。
-        #     写成 pty.write 的话字节会去 slave 端，master 永远读不到。
-        import acg720_protocol as _p
-        pty.write_to_slave(encode(Cmd.SET_VELOCITY, _p.pack_velocity(30, 40, 40, 30)))
-        #   ★ 必须给非零 timeout：PTY 写入到对端可读之间有延迟，
-        #     timeout=0 的读会随机返回空，把"链路正常"误报成"链路断了"
-        cmd_back = pty.read(timeout=1.0)
-        if not cmd_back:
-            print("  ✗ 方向② 失败：往 slave 写了速度命令，master 端没收到")
-            failures += 1
-        else:
-            parsed = [f for f in parser.feed(cmd_back) if f.cmd == Cmd.SET_VELOCITY]
-            if not parsed:
-                print(f"  ✗ 方向② 失败：收到的字节不是合法的 SET_VELOCITY 帧："
-                      f"{cmd_back.hex(' ')}")
-                failures += 1
-            else:
-                v = parse_velocity(parsed[-1].payload)
-                model.apply_velocity(parsed[-1].payload)
-                print(f"  ✓ 方向② 驱动→虚拟车：解析出目标 RPM {v.rpm}，"
-                      f"左/右 = {v.left_rpm}/{v.right_rpm}")
-
-        # ---- ③ 物理模型：低速下限必须复现（这是真车已知缺陷）----
-        #   ⚠ 必须每步喂心跳，否则 300 ms 心跳超时会把目标清零，
-        #     模型永远停在 0 RPM，测试就变成"测了但什么都没测到"
-        model2 = VirtualAcg720(wheel_radius_m=args.wheel_radius,
-                               tracking_floor_rpm=args.tracking_floor_rpm)
-        model2.target_rpm = [3.0, 3.0, 3.0, 3.0]     # 内轮典型低速目标
-        for _ in range(100):                          # 5 s，足够进入稳态
-            model2.last_heartbeat_s = model2.uptime_s
-            model2.step(0.05)
-        steady = model2.wheels[0].rpm
-        if abs(steady - model2.tracking_floor_rpm) < 0.5:
-            print(f"  ✓ 物理模型：目标 3 RPM（低于下限）→ 实际稳定在 "
-                  f"{steady:.1f} RPM，复现了真车低速滑行")
-        else:
-            print(f"  ✗ 物理模型：期望稳定在 {model2.tracking_floor_rpm} RPM，"
-                  f"实际 {steady:.1f} RPM")
-            failures += 1
-
-        # ---- ④ 物理模型：skid 侧滑必须让实际转角小于几何差速预测 ----
-        model3 = VirtualAcg720(ground_truth_separation_scale=args.gt_scale,
-                               ground_truth_separation_m=args.gt_separation)
-        model3.target_rpm = [-20.0, 20.0, 20.0, -20.0]   # 左旋
-        for _ in range(20):                               # 1 s
-            model3.last_heartbeat_s = model3.uptime_s
-            model3.step(0.05)
-        # 实际角速度 = Δv / gt_separation（真值有效轮距）
-        l_rpm, r_rpm = model3.left_right_rpm()
-        delta_v = (r_rpm - l_rpm) * model3.rpm_to_mps
-        actual = delta_v / model3.gt_separation
-        # 几何差速预测 = Δv / 几何轮距（即 scale=1.0 时里程计会报的值）
-        naive = delta_v / args.gt_separation
-        ratio = actual / naive if naive else 0.0
-        expected = 1.0 / args.gt_scale
-        if abs(ratio - expected) < 1e-6:
-            print(f"  ✓ 物理模型：实际转角 = 几何差速预测的 {ratio:.4f} 倍 "
-                  f"(= 1/{args.gt_scale:.2f})，侧滑已生效；"
-                  f"实测 yaw={math.degrees(model3.yaw):+.2f}°")
-        else:
-            print(f"  ✗ 物理模型：侧滑比值 {ratio:.4f}，期望 {expected:.4f}")
-            failures += 1
-
+        code = _dry_run(args, pty)
         pty.close()
-        if failures:
-            print(f"[dry-run] 自检失败 {failures} 项")
-            return 1
-        print("[dry-run] 自检全部通过。")
-        return 0
+        return code
 
     rclpy.init()
-    node = Acg720SimulatorNode(
-        pty, physics_rate_hz=args.physics_rate,
-        telemetry_rate_hz=args.telemetry_rate,
-        wheel_radius_m=args.wheel_radius,
-        counts_per_rev=args.counts_per_rev,
-        tracking_floor_rpm=args.tracking_floor_rpm,
-        ground_truth_separation_m=args.gt_separation,
-        ground_truth_separation_scale=args.gt_scale,
-    )
+    node = Acg720SimulatorNode(pty, _params_from_args(args),
+                               physics_rate_hz=args.physics_rate)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -582,6 +314,155 @@ def main(argv=None) -> int:
         if rclpy.ok():
             rclpy.shutdown()
         pty.close()
+    return 0
+
+
+# ==========================================================================
+# 自检：不依赖 ROS，把"固件最会咬人的几条"逐条证明一遍
+# ==========================================================================
+
+class _MiniHost:
+    """自检用的小主机：管 SEQ、解析回帧、按周期推进。"""
+
+    def __init__(self, fw: Acg720Firmware):
+        self.fw = fw
+        self.seq = SequenceTracker()
+        self.parser = FrameParser()
+        self.frames: List[tuple] = []
+
+    def send(self, kind, payload: bytes = b'') -> List[str]:
+        return self.fw.feed(encode_command(kind, self.seq.take(), payload))
+
+    def drain(self) -> bytes:
+        data = self.fw.drain_tx()
+        self.frames.extend(self.parser.feed(data))
+        return data
+
+    def tick(self, dt: float) -> bytes:
+        data = self.fw.tick(dt)
+        self.frames.extend(self.parser.feed(data))
+        return data
+
+    def of(self, kind) -> List[tuple]:
+        return [f for f in self.frames if f[0] == int(kind)]
+
+
+def _dry_run(args, pty: PtySerial) -> int:
+    print("[dry-run] 不初始化 ROS，验证 PTY 双向通道 + 固件行为…")
+    failures = 0
+
+    def check(name: str, ok: bool, detail: str = "") -> None:
+        nonlocal failures
+        print(f"  {'✓' if ok else '✗'} {name}" + (f"  {detail}" if detail else ""))
+        if not ok:
+            failures += 1
+
+    # ---- ① 方向：虚拟车 → 驱动（把固件的遥测发到 slave 端）----
+    pty.write(encode_command(Kind.HEARTBEAT, 0))     # 任意合法帧，证明通道通
+    got = pty.read_from_slave(timeout=1.0)
+    check("方向① 虚拟车→驱动（master 写、slave 读）", bool(got),
+          f"{len(got)} 字节")
+
+    # ---- ② 方向：驱动 → 虚拟车（slave 写、master 读）----
+    #   ★ 必须是 write_to_slave（扮演驱动），不能是 pty.write（那是虚拟车）。
+    #   ★ 必须给非零 timeout：PTY 写入到对端可读之间有延迟。
+    fw = Acg720Firmware(_params_from_args(args))
+    host = _MiniHost(fw)
+    # 这一帧既是"方向②"的探针，也是真的 ARM。⚠ 必须走 host.seq 取序号，
+    #   否则后面 host.send() 会拿到同一个 SEQ 而被固件判成重复（静默丢弃）。
+    pty.write_to_slave(encode_command(Kind.ARM, host.seq.take()))
+    back = pty.read(timeout=1.0)
+    events = fw.feed(back) if back else []
+    check("方向② 驱动→虚拟车（slave 写、master 读）", bool(back),
+          f"{len(back)} 字节，事件 {events}")
+
+    # ---- ③ ARM → MOVE：状态机走通，且 ACK 回得来 ----
+    host.tick(0.02)
+    host.drain()
+    events = host.send(Kind.MOVE, pack_move(1, 100))
+    for _ in range(10):
+        host.tick(0.02)
+    host.drain()
+    check("ARM 后 MOVE 进入 RUNNING", fw.state == SafetyState.RUNNING,
+          f"state={fw.state.name} events={events}")
+    check("收到了 ACK", len(host.of(Kind.ACK)) >= 1,
+          f"{len(host.of(Kind.ACK))} 帧")
+    check("收到了 0x83 诊断帧且 build_id 正确",
+          any(parse_diagnostic(f[2])['build_id_hex'] == '20260A02'
+              for f in host.of(Kind.DIAGNOSTIC)))
+
+    # ---- ④ 非法帧（VERSION 错）必须锁死 ----
+    fw2 = Acg720Firmware(_params_from_args(args))
+    bad = bytearray(encode_command(Kind.HEARTBEAT, 0))
+    bad[2] = 0x02
+    fw2.feed(bytes(bad))
+    fw2.tick(0.02)
+    check("VERSION 错的帧锁死底盘（PROTOCOL）",
+          fw2.state == SafetyState.FAULT and fw2.fault == FaultReason.PROTOCOL,
+          f"state={fw2.state.name} fault={fw2.fault.name}")
+
+    # ---- ⑤ 3.0 s 连续运动上限：连 10 Hz 重发 MOVE 也躲不过 ----
+    fw3 = Acg720Firmware(_params_from_args(args))
+    host3 = _MiniHost(fw3)
+    host3.send(Kind.ARM)
+    host3.tick(0.02)
+    t = 0.0
+    next_at = 0.0
+    while t < fw3.p.run_limit_s + 0.6:
+        if t >= next_at - 1e-12:
+            host3.send(Kind.MOVE, pack_move(1, 100))
+            next_at += 0.1
+        host3.tick(0.02)
+        t += 0.02
+    check(f"连续运动 {fw3.p.run_limit_s}s 后锁死 RUN_LIMIT",
+          fw3.state == SafetyState.FAULT and fw3.fault == FaultReason.RUN_LIMIT,
+          f"state={fw3.state.name} fault={fw3.fault.name}")
+
+    # ---- ⑥ 位置环：走完并报 OK（且不受 3 s 上限约束）----
+    fw4 = Acg720Firmware(_params_from_args(args))
+    host4 = _MiniHost(fw4)
+    host4.send(Kind.ARM)
+    host4.tick(0.02)
+    host4.send(Kind.POSITION, pack_position(1, 25, 3232))
+    t = 0.0
+    next_at = 0.0
+    progress = []
+    while t < 12.0 and fw4.position.busy:
+        if t >= next_at - 1e-12:
+            host4.send(Kind.HEARTBEAT)
+            next_at += 0.1
+        host4.tick(0.02)
+        t += 0.02
+        progress.append(fw4.position.progress_counts)
+    ok = fw4.position.result_code.name == 'OK'
+    check("位置动作走完并报 OK（>3 s 也不触发上限）", ok,
+          f"progress={fw4.position.progress_counts} t={t:.2f}s "
+          f"result={fw4.position.result_code.name}")
+    check("位置遥测 0x84 报得出进度",
+          any(parse_position_telemetry(f[2])['target_counts'] == 3232
+              for f in host4.of(Kind.POSITION_TELEMETRY)))
+
+    # ---- ⑦ 低速滑行下限（真车缺陷）必须复现 ----
+    fw5 = Acg720Firmware(_params_from_args(args))
+    host5 = _MiniHost(fw5)
+    host5.send(Kind.ARM)
+    host5.tick(0.02)
+    t = 0.0
+    next_at = 0.0
+    while t < 1.5:
+        if t >= next_at - 1e-12:
+            host5.send(Kind.MOVE, pack_move(1, 3))
+            next_at += 0.1
+        host5.tick(0.02)
+        t += 0.02
+    steady = fw5.plant.rpm_f[0]
+    check(f"目标 3 RPM（低于下限）→ 实际稳定在 ≈{fw5.p.tracking_floor_rpm} RPM",
+          abs(steady - fw5.p.tracking_floor_rpm) < 0.5, f"{steady:.2f} RPM")
+
+    if failures:
+        print(f"[dry-run] 自检失败 {failures} 项")
+        return 1
+    print("[dry-run] 自检全部通过。")
     return 0
 
 
