@@ -1,310 +1,32 @@
 #!/usr/bin/env python3
-"""ACG720 协议层 + 运动学的单元测试。
+"""四轮运动学与位姿积分的单元测试。
 
-这些都是纯函数测试，不需要 ROS、不需要硬件，所以可以在任何机器上秒级跑完：
+⚠ 本文件原本还含"旧协议"（凭空发明的那套 MODBUS 帧）的测试。
+   那套协议**跟真固件说不上一句话**（第 3 个字节就会被判版本错），
+   已经整体作废：真协议在 `acg720_protocol_v1.py`，它的 68 条测试在
+   `test_protocol_v1.py`（含与厂商实现的活体交叉核对）。
+   这里只留下**与协议无关**的部分：轮位 ↔ 左右、几何换算、位姿积分。
 
-    python3 -m pytest src/my_robot_description/test/ -v
+为什么这些值得单独测：符号约定和尺度是"接上真车才发现"的两类 bug，
+而真车调试的代价远高于这里写测试的代价 —— 左右轮搞反了车会反向转弯，
+日志上却看起来一切正常。
 
-为什么值得写：协议字节布局和运动学符号是"接上真车才发现"的两类 bug，
-而真车调试的代价远高于这里写测试的代价。尤其是**符号约定**——
-左右轮搞反了车会反向转弯，而日志上看起来一切正常。
+跑法：
+    pytest src/my_robot_description/test/test_protocol_and_kinematics.py -q
 """
 
 import math
 import os
-import struct
 import sys
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from acg720_protocol import (  # noqa: E402
-    Cmd, Flag, Frame, FrameParser, PositionDone, STATUS_SIZE, Status,
-    TELEMETRY_FORMAT, Telemetry,
-    crc16, encode, lr_to_wheels, pack_heartbeat, pack_position,
-    pack_position_done, pack_status, pack_telemetry, pack_velocity,
-    parse_position_done, parse_status, parse_telemetry, parse_velocity,
-    wheels_to_lr,
-)
 from drive_kinematics import (  # noqa: E402
-    Pose2D, SkidSteerGeometry, quaternion_from_yaw, wrap_angle,
+    Pose2D, SkidSteerGeometry, lr_to_wheels, move_to_twist,
+    quaternion_from_yaw, twist_to_move, wheels_to_lr, wrap_angle,
 )
-
-
-# ==========================================================================
-# CRC
-# ==========================================================================
-
-def test_crc16_modbus_golden_vector():
-    """CRC-16/MODBUS 的标准测试向量：b"123456789" → 0x4B37。
-
-    这是钉死 CRC 实现是否正确的唯一硬证据。如果 FPGA 侧用的是别的多项式
-    （比如 CCITT 0x1021），这个测试会立刻告诉我们，而不是等到现场 CRC 全红。
-    """
-    assert crc16(b"123456789") == 0x4B37
-
-
-def test_crc16_empty():
-    assert crc16(b"") == 0xFFFF
-
-
-def test_crc16_differs_on_single_bit():
-    a, b = crc16(b"\x01\x02\x03"), crc16(b"\x01\x02\x02")
-    assert a != b
-    # 单比特差应该让 CRC 差很多位，不是只差 1
-    assert bin(a ^ b).count("1") > 3
-
-
-# ==========================================================================
-# 帧编解码：往返
-# ==========================================================================
-
-@pytest.mark.parametrize("cmd,payload", [
-    (Cmd.HEARTBEAT, pack_heartbeat(0)),
-    (Cmd.HEARTBEAT, pack_heartbeat(255)),
-    (Cmd.SET_VELOCITY, pack_velocity(0, 0, 0, 0)),
-    (Cmd.SET_VELOCITY, pack_velocity(30, 40, 40, 30)),
-    (Cmd.SET_VELOCITY, pack_velocity(-20, -20, 20, 20)),
-    (Cmd.SET_VELOCITY, pack_velocity(32767, -32768, 0, 1)),
-    (Cmd.POSITION, pack_position(1320, 15, 1, 240)),
-    (Cmd.POSITION, pack_position(-2640, 8, 0, 240)),
-    (Cmd.TELEMETRY, b""),
-    (0x99, b"\x01\x02\x03"),
-])
-def test_frame_roundtrip(cmd, payload):
-    parser = FrameParser()
-    frames = parser.feed(encode(cmd, payload))
-    assert len(frames) == 1
-    assert frames[0].cmd == cmd
-    assert frames[0].payload == payload
-
-
-def test_encode_has_correct_header_and_crc():
-    raw = encode(Cmd.HEARTBEAT, b"\x07")
-    assert raw[:2] == b"\xA5\x5A"
-    assert raw[2] == 0x06
-    assert raw[3] == 0x01
-    assert raw[4] == 0x07
-    # CRC 覆盖 TYPE+LEN+PAYLOAD
-    assert struct.unpack("<H", raw[-2:])[0] == crc16(raw[2:-2])
-
-
-def test_encode_rejects_oversized_payload():
-    with pytest.raises(ValueError):
-        encode(Cmd.TELEMETRY, b"\x00" * 65)
-
-
-# ==========================================================================
-# 帧解析：流式重新同步（真串口一定会遇到的场景）
-# ==========================================================================
-
-def test_parser_handles_split_reads():
-    """一次 read 只拿到半个帧，也要能拼起来。"""
-    raw = encode(Cmd.SET_VELOCITY, pack_velocity(1, 2, 3, 4))
-    parser = FrameParser()
-    # 逐字节喂
-    frames = []
-    for i in range(len(raw)):
-        frames.extend(parser.feed(raw[i:i + 1]))
-    assert len(frames) == 1
-    assert frames[0].cmd == Cmd.SET_VELOCITY
-
-
-def test_parser_handles_multiple_frames_in_one_read():
-    parser = FrameParser()
-    blob = (encode(Cmd.HEARTBEAT, b"\x01") + encode(Cmd.HEARTBEAT, b"\x02")
-            + encode(Cmd.STATUS, pack_status(Status(2, True, 0, 1234))))
-    frames = parser.feed(blob)
-    assert [f.cmd for f in frames] == [Cmd.HEARTBEAT, Cmd.HEARTBEAT, Cmd.STATUS]
-
-
-def test_parser_drops_leading_garbage():
-    parser = FrameParser()
-    frames = parser.feed(b"\x00\x11\x22" + encode(Cmd.HEARTBEAT, b"\x05"))
-    assert len(frames) == 1
-    assert frames[0].payload == b"\x05"
-    assert parser.dropped_bytes == 3
-
-
-def test_parser_resyncs_after_crc_error():
-    """CRC 坏帧之后必须能恢复，否则一次干扰就永久失步。"""
-    good1 = encode(Cmd.HEARTBEAT, b"\x01")
-    bad = bytearray(encode(Cmd.HEARTBEAT, b"\x02"))
-    bad[-1] ^= 0xFF            # 破坏 CRC
-    good2 = encode(Cmd.HEARTBEAT, b"\x03")
-
-    parser = FrameParser()
-    frames = parser.feed(bytes(bad) + good1 + good2)
-    # 坏帧被丢，两个好帧都要解出来
-    assert [f.payload for f in frames] == [b"\x01", b"\x03"]
-    assert parser.crc_errors == 1
-
-
-def test_parser_rejects_absurd_length():
-    """长度字段非法时不能傻等 255 字节，要立刻重新同步。"""
-    parser = FrameParser()
-    frames = parser.feed(b"\xA5\x5A\x84\xFF" + encode(Cmd.HEARTBEAT, b"\x09"))
-    assert len(frames) == 1
-    assert frames[0].payload == b"\x09"
-
-
-def test_parser_keeps_partial_header():
-    """只有一个 0xA5 时要留住它，下一批数据的 0x5A 才能凑成帧头。"""
-    parser = FrameParser()
-    assert parser.feed(b"\xA5") == []
-    assert parser.pending_bytes == 1
-    frames = parser.feed(b"\x5A" + encode(Cmd.HEARTBEAT, b"\x01")[2:])
-    assert len(frames) == 1
-
-
-def test_parser_records_unknown_cmd():
-    """FPGA 将来加了新上报类型，要能看出来而不是静默丢弃。"""
-    parser = FrameParser()
-    frames = parser.feed(encode(0x90, b"\xAA"))
-    assert frames[0].cmd == 0x90
-    assert parser.unknown_cmd == [0x90]
-
-
-# ==========================================================================
-# payload 编解码
-# ==========================================================================
-
-def test_velocity_payload_is_int16_little_endian():
-    payload = pack_velocity(1, -1, 300, -300)
-    assert payload == struct.pack("<4h", 1, -1, 300, -300)
-    assert len(payload) == 8
-
-
-def test_velocity_rejects_out_of_range():
-    with pytest.raises(ValueError):
-        pack_velocity(40000, 0, 0, 0)
-
-
-def test_position_payload_layout():
-    payload = pack_position(counts=-1320, rpm=15, mode=1, timeout_samples=240)
-    assert payload == struct.pack("<ihBH", -1320, 15, 1, 240)
-
-
-def test_telemetry_roundtrip():
-    t = Telemetry(seq=12345, uptime_ms=67890,
-                  counts=(10, -20, 30, -40), rpm=(7, 8, -9, -10),
-                  duty=(0, 821, 870, 2700), flags=Flag.LOW_SPEED_WARN | Flag.STALL)
-    parsed = parse_telemetry(pack_telemetry(t))
-    assert parsed == t
-
-
-def test_telemetry_rejects_wrong_length():
-    with pytest.raises(ValueError):
-        parse_telemetry(b"\x00" * 5)
-
-
-def test_telemetry_flag_names():
-    t = Telemetry(0, 0, (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0),
-                  Flag.ESTOP | Flag.OVERSPEED)
-    assert set(t.flag_names()) == {"ESTOP", "OVERSPEED"}
-
-
-def test_telemetry_left_right_averaging():
-    """A=右前 D=右后 B=左前 C=左后。这个顺序搞错就是原地转反向。"""
-    t = Telemetry(0, 0, (0,) * 4, rpm=(40, 10, 10, 40), duty=(0,) * 4, flags=0)
-    assert t.right_rpm == 40.0
-    assert t.left_rpm == 10.0
-
-
-def test_status_roundtrip():
-    s = Status(heartbeat_echo=7, accepted=False, reject_code=1, uptime_ms=999)
-    assert parse_status(pack_status(s)) == s
-
-
-def test_status_reject_names_cover_all_codes():
-    from acg720_protocol import REJECT_NAMES
-    assert set(REJECT_NAMES) == {0, 1, 2, 3, 4}
-
-
-def test_position_done_roundtrip():
-    p = PositionDone(mode=1, success=False, reason=2,
-                     final_counts=-1320, elapsed_samples=240)
-    parsed = parse_position_done(pack_position_done(p))
-    assert parsed.mode == 1
-    assert parsed.success is False
-    assert parsed.reason == 2
-    assert parsed.final_counts == -1320
-    assert parsed.elapsed_samples == 240
-
-
-# ==========================================================================
-# payload 布局：把字节数和字段偏移钉死
-# ==========================================================================
-
-def test_payload_sizes_are_exact():
-    """字节数必须精确。
-
-    这个测试的存在理由：`struct` 会**静默插入对齐 padding**。
-    最初 STATUS 写成 "<IBBI" 时，calcsize 是 10 而不是直觉上的 7——
-    uint32 被对齐到 4 字节边界，中间多了 3 个字节。
-    协议里出现隐式 padding，就等于"上位机和 FPGA 对不上"，
-    而且换一种语言重写时 padding 规则还可能不同。
-    所以这里把每个 payload 的确切字节数钉死。
-    """
-    from acg720_protocol import (POSITION_DONE_SIZE, STATUS_SIZE,
-                                 TELEMETRY_SIZE, VELOCITY_SIZE)
-    assert VELOCITY_SIZE == 8          # 4 × int16
-    assert TELEMETRY_SIZE == 34        # 2×u32 + 4×i16 + 4×i16 + 4×u16 + u16
-    assert STATUS_SIZE == 8            # 3×u8 + 1 显式 pad + u32
-    assert POSITION_DONE_SIZE == 10
-
-
-def test_telemetry_field_offsets():
-    """遥测每个字段的偏移必须与文档一致（真机靠这个对齐）。"""
-    assert TELEMETRY_FORMAT == "<II4h4h4HH"
-    t = Telemetry(seq=0x11223344, uptime_ms=0x55667788,
-                  counts=(1, 2, 3, 4), rpm=(5, 6, 7, 8),
-                  duty=(9, 10, 11, 12), flags=0xBEEF)
-    raw = pack_telemetry(t)
-    assert len(raw) == 34
-    assert struct.unpack_from("<I", raw, 0)[0] == 0x11223344    # seq @0
-    assert struct.unpack_from("<I", raw, 4)[0] == 0x55667788    # uptime @4
-    assert struct.unpack_from("<4h", raw, 8) == (1, 2, 3, 4)    # counts @8
-    assert struct.unpack_from("<4h", raw, 16) == (5, 6, 7, 8)   # rpm @16
-    assert struct.unpack_from("<4H", raw, 24) == (9, 10, 11, 12)  # duty @24
-    assert struct.unpack_from("<H", raw, 32)[0] == 0xBEEF       # flags @32
-
-
-def test_status_layout_is_explicit_and_c_aligned():
-    """STATUS 必须是 8 字节，uptime 落在偏移 4，且**不依赖 struct 的隐式对齐**。
-
-    为什么较真这个（都是真实踩过的）：
-      * "<IBBI"   → 14 字节（隐式插 4 字节）
-      * "<IBB3xI" → 13 字节（uptime 在偏移 6）
-      * "<IBBxI"  → 11 字节（开头的 I 让整体带 4 字节对齐，x 之后又被插 padding）
-      * "<4BI"    → 8 字节 ✓（把 pad 写成第 4 个 B，位置完全由字段决定）
-
-    所以这里断言的不是"格式串里有没有 x"，而是**字节布局本身**：
-    pad 用一个恒为 0 的 B 表示，uint32 落在 4 字节边界（与 C 默认对齐一致）。
-    """
-    from acg720_protocol import STATUS_FORMAT
-    assert STATUS_FORMAT == "<4BI", (
-        "STATUS_FORMAT 必须是 <4BI：用 x 做 padding 时，前面的 4 字节字段会带来"
-        "隐式对齐，calcsize 不再是直觉值")
-    assert STATUS_SIZE == 8
-    raw = pack_status(Status(7, False, 1, 0xAABBCCDD))
-    assert len(raw) == 8
-    assert raw[0] == 7 and raw[1] == 0 and raw[2] == 1
-    assert raw[3] == 0                        # 显式 padding 必须是 0
-    assert struct.unpack_from("<I", raw, 4)[0] == 0xAABBCCDD   # uptime @4
-
-
-def test_velocity_field_order_is_A_B_C_D():
-    """速度 payload 的顺序必须是 A,B,C,D（右前/左前/左后/右后）。
-
-    顺序错了 = 车按错误的轮子组合运动。这里用四个互不相同的值钉住顺序。
-    """
-    raw = pack_velocity(11, 22, 33, 44)
-    assert struct.unpack("<4h", raw) == (11, 22, 33, 44)
-    from acg720_protocol import parse_velocity
-    assert parse_velocity(raw).rpm == (11, 22, 33, 44)
-
 
 # ==========================================================================
 # 四轮 ↔ 左右 的归一化
@@ -509,3 +231,181 @@ def test_quaternion_from_yaw():
     assert z == pytest.approx(math.sin(math.pi / 4))
     assert w == pytest.approx(math.cos(math.pi / 4))
     assert z * z + w * w == pytest.approx(1.0)
+
+
+# ==========================================================================
+# 0x02 MOVE 的反解与正解
+# ==========================================================================
+#
+# 这一节钉住的是"哪些 (v, ω) 固件根本表达不出来"，以及**投影的方向**。
+# 依据：chassis_motion.v:32-87 —— 内侧轮 `base×ratio>>8` 是**无符号**的，
+# 只能缩小、不能反转、不能独立赋值。
+
+def test_twist_to_move_straight_line():
+    g = SkidSteerGeometry()
+    mc = twist_to_move(0.10, 0.0, g)
+    assert mc.motion_mode == 1                 # FORWARD
+    assert mc.achievable
+    assert mc.v == pytest.approx(0.10, abs=0.005)
+    assert mc.omega == pytest.approx(0.0, abs=1e-9)
+
+
+def test_twist_to_move_arc_uses_turn_modes():
+    """左转 → mode 3 且内侧是左轮；右转 → mode 4 且内侧是右轮。"""
+    g = SkidSteerGeometry()
+    left = twist_to_move(0.15, +0.4, g)
+    right = twist_to_move(0.15, -0.4, g)
+    assert left.motion_mode == 3
+    assert right.motion_mode == 4
+    assert left.achievable and right.achievable
+    # 内侧轮比外侧慢，但**同号**
+    assert 0 <= left.turn_inner_ratio_q8 < 255
+    assert 0 <= right.turn_inner_ratio_q8 < 255
+    assert left.omega > 0 > right.omega
+
+
+def test_arc_round_trip_within_reachable_region():
+    """可达区内 (v, ω) → MOVE → (v, ω) 基本还原（差在 ratio 的 1/256 量化）。
+
+    可达判据是 `R = v/ω ≥ L/2`，即 `|ω| ≤ 2v/L`。所以这里按 v 配 ω，
+    不去测本来就该被投影掉的组合 —— 那由后面几条测试专门覆盖。
+    """
+    g = SkidSteerGeometry()
+    for v in (0.05, 0.10, 0.20):
+        limit = 2.0 * v / g.effective_separation_m
+        for frac in (-0.95, -0.5, 0.0, 0.5, 0.95):
+            omega = limit * frac
+            mc = twist_to_move(v, omega, g)
+            assert mc.achievable, f"({v},{omega}) 应当可达"
+            assert mc.v == pytest.approx(v, abs=0.01)
+            assert mc.omega == pytest.approx(omega, abs=0.03)
+
+
+def test_tightest_reachable_turn_is_half_track_width():
+    """`ratio=0`（内侧轮停转）就是最紧的弯：半径 = 有效轮距/2。
+
+    这是"内侧轮不能反转"直接推出来的物理下限，也是必须让导航层知道的约束。
+    """
+    g = SkidSteerGeometry()
+    mc = twist_to_move(0.10, 1.0, g)          # v/ω = 0.1 = L/2
+    assert mc.motion_mode == 3
+    assert mc.turn_inner_ratio_q8 == 0
+    assert mc.achievable
+
+
+def test_sharper_than_half_track_is_projected_to_spin():
+    """半径 < L/2 需要内侧轮反转 → 投影成原地转，并且**必须**标记不可达。"""
+    g = SkidSteerGeometry()
+    mc = twist_to_move(0.05, 1.2, g)           # v/ω ≈ 0.042 < 0.1
+    assert mc.motion_mode in (5, 6)
+    assert not mc.achievable
+    assert mc.note, '投影必须留下说明，不能静默吃掉 v'
+    assert abs(mc.v) < 1e-9, '投影后应当是纯原地转'
+    assert mc.omega > 0
+
+
+def test_reverse_arc_is_projected_to_straight_backward_preserving_v():
+    """固件没有"倒退转弯"这种动作（mode 2 只有直退）→ 丢掉 ω、**保留 v**。
+
+    ★ 保留 v 而不是"按峰值轮速推算"很重要：后者会让车比命令的更快，
+      方向是危险的。这条测试就是钉住这个选择。
+    """
+    g = SkidSteerGeometry()
+    mc = twist_to_move(-0.10, 0.30, g)
+    assert mc.motion_mode == 2
+    assert not mc.achievable
+    assert mc.v == pytest.approx(-0.10, abs=0.005), '投影后速度应当还是命令速度'
+    assert mc.omega == pytest.approx(0.0, abs=1e-9)
+
+
+def test_pure_spin_is_exact():
+    g = SkidSteerGeometry()
+    for omega in (0.5, -0.5):
+        mc = twist_to_move(0.0, omega, g)
+        assert mc.achievable
+        assert mc.motion_mode == (5 if omega > 0 else 6)
+        assert mc.omega == pytest.approx(omega, abs=0.02)
+
+
+def test_over_rpm_limit_is_reported_not_silently_clamped():
+    g = SkidSteerGeometry()
+    mc = twist_to_move(0.9, 0.0, g)
+    assert not mc.achievable
+    assert mc.motion_mode == 0 and mc.base_rpm == 0
+    assert '200' in mc.note
+
+
+def test_move_to_twist_forward_and_backward():
+    g = SkidSteerGeometry()
+    v, omega = move_to_twist(1, 29, 255, g)
+    assert v == pytest.approx(0.10, abs=0.005)
+    assert omega == pytest.approx(0.0, abs=1e-9)
+    v, omega = move_to_twist(2, 29, 255, g)
+    assert v == pytest.approx(-0.10, abs=0.005)
+
+
+def test_move_to_twist_matches_the_firmware_expansion():
+    """正解必须走固件自己的展开逻辑，不能另写一套。
+
+    否则驱动的 `achieved=` 诊断会与固件真实行为不符 —— 那种"日志说 A、
+    车做 B"的偏差在真机上极难查。
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    from acg720_firmware import chassis_motion
+
+    g = SkidSteerGeometry()
+    wheels = chassis_motion(3, 100, 128)
+    left = (wheels[1] + wheels[2]) / 2.0
+    right = (wheels[0] + wheels[3]) / 2.0
+    assert move_to_twist(3, 100, 128, g) == pytest.approx(
+        g.wheels_to_twist(left, right))
+
+
+def test_twist_to_move_rejects_bad_limit():
+    with pytest.raises(ValueError):
+        twist_to_move(0.1, 0.0, SkidSteerGeometry(), max_base_rpm=0)
+
+
+# ==========================================================================
+# 0x05 POSITION 的目标计数口径
+# ==========================================================================
+#
+# ★ 口径来自 chassis_position_controller.v:78：
+#       progress = (归一化四轮增量之和) >> 2
+#   是**平均**不是求和。搞错的话标定出来的每米计数会差 4 倍。
+
+def test_position_counts_for_half_metre_is_3232():
+    """0.5 m ↔ 3232 计数。
+
+    这不是巧合：交接包示例里的 `POSITION(1, 25, 3232)` 正好是 0.5 m。
+    这个数从"1320 计数/圈 + 65 mm 轮径"独立算出来能对上，
+    是对 CPR 与轮径这一组参数的一次反向印证。
+    """
+    g = SkidSteerGeometry()
+    assert g.distance_to_position_counts(0.5) == pytest.approx(3232.1, abs=1.0)
+    assert g.position_counts_to_distance_m(3232) == pytest.approx(0.5000, abs=0.001)
+
+
+def test_position_counts_for_quarter_turn():
+    """90° 原地转 ≈ 1015 计数（几何轮距、scale=1 时）。"""
+    g = SkidSteerGeometry()
+    assert g.rotation_to_position_counts(math.pi / 2) == pytest.approx(1015.4, abs=1.0)
+    assert g.position_counts_to_rotation_rad(1015.4) == pytest.approx(math.pi / 2, abs=1e-3)
+
+
+def test_position_rotation_uses_effective_separation():
+    """原地转的计数必须随有效轮距变 —— 打滑越大，转同样的角要走更多计数。"""
+    geo = SkidSteerGeometry(scale=1.0)
+    skid = SkidSteerGeometry(scale=1.4)
+    assert skid.rotation_to_position_counts(1.0) == pytest.approx(
+        geo.rotation_to_position_counts(1.0) * 1.4, rel=1e-9)
+
+
+def test_position_counts_round_trip():
+    g = SkidSteerGeometry(scale=1.2)
+    for metres in (0.0, 0.1, 0.5, 3.0):
+        assert g.position_counts_to_distance_m(
+            g.distance_to_position_counts(metres)) == pytest.approx(metres, abs=1e-9)
+    for rad in (0.0, 0.5, math.pi, 2 * math.pi):
+        assert g.position_counts_to_rotation_rad(
+            g.rotation_to_position_counts(rad)) == pytest.approx(rad, abs=1e-9)
