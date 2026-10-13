@@ -57,7 +57,7 @@ from std_msgs.msg import String
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from acg720_firmware import (  # noqa: E402
-    Acg720Firmware, FirmwareParams, SafetyState, FaultReason,
+    Acg720Firmware, FirmwareParams, SafetyState, FaultReason, fault_cn,
 )
 from acg720_protocol_v1 import (  # noqa: E402
     Kind, FrameParser, SequenceTracker, encode_command, pack_move, pack_position,
@@ -140,6 +140,10 @@ class PtySerial:
             os.write(self.master_fd, data)
         except BlockingIOError:
             pass   # PTY 缓冲满：直接丢，和真串口丢字节的行为一致
+        except OSError:
+            # 从机还没被打开（刚启动那几拍）时 master 写会返回 EIO。
+            # 直接丢即可 —— 那几帧遥测本来就没人收。
+            pass
 
     def close(self) -> None:
         for fd in (self.master_fd, self.slave_fd):
@@ -208,7 +212,7 @@ class Acg720SimulatorNode(Node):
         fault = self.fw.fault
         if self.fw.state == SafetyState.FAULT and fault != self._last_fault:
             self.get_logger().error(
-                f"★ 虚拟底盘已锁死：{fault.name}（{fault_name_cn(fault)}）。"
+                f"★ 虚拟底盘已锁死：{fault.name}（{fault_cn(fault)}）。"
                 f"真机上这只能靠复位解除 —— 驱动不该再发运动命令。")
         self._last_fault = fault if self.fw.state == SafetyState.FAULT else None
 
@@ -225,23 +229,6 @@ class Acg720SimulatorNode(Node):
                 f"counts={p.position_counts} rpm={p.measured_rpm} "
                 f"frames_in={self._frames_in}"
             )))
-
-
-#: 故障码的中文名。真机现场看到 FAULT 时必须立刻知道"下一步该干什么"，
-#: 所以这里连"怎么恢复"一起说清楚。
-_FAULT_CN = {
-    FaultReason.NONE: "无",
-    FaultReason.ESTOP: "急停被按下（松开 S0 后按 S4 复位）",
-    FaultReason.MOTOR: "电机通道故障",
-    FaultReason.PROTOCOL: "协议故障 —— 有一帧被判定非法（CRC/版本/长度/语义）",
-    FaultReason.TIMEOUT: "命令超时 —— 超过 300 ms 没有收到有效命令",
-    FaultReason.RUN_LIMIT: ("连续运动超过 3.0 s 上限 —— 这是当前固件的已知限制，"
-                            "不是主机 bug；需要 FPGA 变更才能连续导航"),
-}
-
-
-def fault_name_cn(fault: FaultReason) -> str:
-    return _FAULT_CN.get(fault, "未知")
 
 
 # ==========================================================================

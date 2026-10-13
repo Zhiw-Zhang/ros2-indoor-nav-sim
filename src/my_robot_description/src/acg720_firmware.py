@@ -855,6 +855,31 @@ class SafetyFsm:
 
 
 # ============================================================================
+# 故障码的中文说明 —— 单一出处
+# ============================================================================
+# 真机现场看到 FAULT 时必须立刻知道"这是什么、下一步该干什么"。
+# 所以这里连**恢复方法**一起写清楚，虚拟车和驱动节点共用这一份，
+# 免得两边对同一个故障码给出不同解释。
+
+FAULT_CN = {
+    FaultReason.NONE: "无",
+    FaultReason.ESTOP: "急停被按下（松开 S0 后按 S4 复位）",
+    FaultReason.MOTOR: "电机通道故障",
+    FaultReason.PROTOCOL: "协议故障 —— 有一帧被判定非法（CRC/版本/长度/语义越界）；"
+                          "常见的自伤原因是主机发了固件不认识或越界的目标",
+    FaultReason.TIMEOUT: "命令超时 —— 超过 300 ms 没有收到有效命令；"
+                         "主机必须持续发命令（运动时重发 MOVE，静止时发 HEARTBEAT）",
+    FaultReason.RUN_LIMIT: "连续运动超过 3.0 s 上限。★ 这是当前固件的**已知限制**，"
+                           "不是主机 bug；连续导航必须靠 FPGA 变更才能实现，"
+                           "严禁用周期 STOP/重新 ARM 绕过",
+}
+
+
+def fault_cn(fault: FaultReason) -> str:
+    return FAULT_CN.get(fault, "未知故障")
+
+
+# ============================================================================
 # 被控对象：电机 + 编码器 + 车体位姿
 # ============================================================================
 
@@ -1105,8 +1130,7 @@ class Acg720Firmware:
         self.diagnostic_counter = 0
         self.imu_sample_counter = 0
 
-        self._sample_accum = 0.0
-        self._telemetry_accum = 0.0
+        self._tick50_accum = 0.0
         self._pending_command: Optional[dict] = None
         self._protocol_fault_pulse = False
         self._protocol_fault_count = 0
@@ -1183,9 +1207,9 @@ class Acg720Firmware:
         """一拍。次序与 RTL 的时钟沿一致，顺序本身有意义，改动前先想清楚：
 
             ① 时间                      ② RX 帧内超时（不置 fault）
-            ③ uptime_ms                 ④ 20 Hz 遥测计数器 → pending
-            ⑤ TX 仲裁 + 故障脉冲汇总      ⑥ 50 ms 采样：编码器 + 位置环
-            ⑦ 安全状态机                 ⑧ 被控对象
+            ③ uptime_ms                 ④ X 50 ms 节拍：编码器 + 位置环 + 遥测
+            ⑤ TX 仲裁 + 故障脉冲汇总
+            ⑥ 安全状态机                 ⑦ 被控对象
         """
         self.t += dt
 
@@ -1196,11 +1220,17 @@ class Acg720Firmware:
         # ③ 运行时间
         self.uptime_ms = int(self.t * 1000.0) & 0xFFFFFFFF
 
-        # ④ 20 Hz 周期遥测
-        self._telemetry_accum += dt
-        while self._telemetry_accum >= self.p.telemetry_period_s:
-            self._telemetry_accum -= self.p.telemetry_period_s
-            self.tx.mark_periodic()
+        # ④ 50 ms 时基：编码器采样与 20 Hz 遥测**共用同一个计数器**
+        #    ★ RTL 里 `SAMPLE_CYCLES` 与 `TELEMETRY_PERIOD_CYCLES` 都是 2_500_000
+        #      （50 ms），也就是同一个节拍。早先这里写成两个独立的累加器，
+        #      两者相位会漂移 → 相邻两帧 0x83 有时报同一份 `position_count`，
+        #      里程计就出现"0、0、双倍"的阶梯（HIL 测试抓到的）。
+        #      合并不是"优化"，是**忠实**。
+        self._tick50_accum += dt
+        while self._tick50_accum >= self.p.sample_tick_s:
+            self._tick50_accum -= self.p.sample_tick_s
+            self._on_sample_tick()                       # 编码器 + 位置环
+            self.tx.mark_periodic()                      # 20 Hz 四包
             self.diagnostic_counter = (self.diagnostic_counter + 1) & 0xFFFF
             self.imu_sample_counter = (self.imu_sample_counter + 1) & 0xFFFF
 
@@ -1220,13 +1250,7 @@ class Acg720Firmware:
         if self._protocol_fault_pulse:
             self._protocol_fault_count += 1
 
-        # ⑥ 50 ms 采样
-        self._sample_accum += dt
-        while self._sample_accum >= self.p.sample_tick_s:
-            self._sample_accum -= self.p.sample_tick_s
-            self._on_sample_tick()
-
-        # ⑦ 安全状态机。command_valid / protocol_fault / internal_stop
+        # ⑥ 安全状态机。command_valid / protocol_fault / internal_stop
         #    在 RTL 里都是**同一周期**的信号，所以这里也必须同拍可见。
         self.safety.protocol_fault = self._protocol_fault_pulse
         self.safety.internal_stop = self.position.internal_stop_pulse
@@ -1236,7 +1260,7 @@ class Acg720Firmware:
         self._protocol_fault_pulse = False
         self.position.internal_stop_pulse = False
 
-        # ⑧ 被控对象
+        # ⑦ 被控对象
         self.plant.advance(dt, self.target_rpm(), self.safety.motor_stby)
 
     def _on_sample_tick(self) -> None:
