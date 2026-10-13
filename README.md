@@ -166,6 +166,8 @@ ros2 launch my_robot_description nav.launch.py world:=rooms_obstacles.sdf \
 | [tools.md](src/my_robot_description/docs/tools.md) | 五个验收脚本 |
 | [real_robot_plan.md](src/my_robot_description/docs/real_robot_plan.md) | **实车迁移计划** |
 | [real_robot_params.md](src/my_robot_description/docs/real_robot_params.md) | **实车参数标定手册** |
+| [acg720_protocol.md](src/my_robot_description/docs/acg720_protocol.md) | **真机底盘驱动层**：真串口协议（逐行标注 RTL 出处）、驱动节点、虚拟底盘 |
+| [fpga_change_request.md](src/my_robot_description/docs/fpga_change_request.md) | **给 FPGA 的变更需求**：连续导航为什么做不了、改哪一处、怎么验 |
 | [docker/README.md](docker/README.md) | **在 RK3588 板子上用容器跑**（宿主 22.04 → 容器里的 Jazzy） |
 
 ---
@@ -189,9 +191,14 @@ ros2 run my_robot_description acg720_simulator --no-driver
 ros2 launch my_robot_description robot.launch.py port:=/dev/pts/N nav:=false
 ```
 
+协议（含 CRC、SEQ、7 条命令、5 种遥测）与**固件行为**
+（安全状态机、3 秒运行上限、故障自锁、ACK 单槽）都是**照着 FPGA 源码逐行复刻**的，
+每条结论都标了 `文件:行号`，并与厂商的 `chassis_control.py` 做了逐字节交叉核对。
 细节见 [`acg720_protocol.md`](src/my_robot_description/docs/acg720_protocol.md)。
-验证规模：**54 例纯函数单测 + 30 项 HIL 集成测试 + 20 项 launch 冒烟测试**，
-含 skid-steer 标定闭环（`θ_odom/θ_true` 从 1.361 收到 1.005）。
+
+验证规模：**231 例纯函数单测 + 59 项 HIL 集成测试 + 32 项 launch 冒烟测试**，
+含 skid-steer 标定闭环（`θ_odom/θ_true` 从 1.36 收到 1.00）、
+"非法帧会锁死底盘"、"连续运动 3.0 s 后锁死并如实上报"等真固件行为。
 
 ### 板子上怎么跑：Ubuntu 22.04 + 容器
 
@@ -219,10 +226,14 @@ docker/run.sh ros2 run my_robot_description platform_check.py
 
 ### 接真车前必须解决的两条
 
-* ⚠️ **串口 payload 字节布局没有权威来源。** 交接包只给了帧头 `A5 5A` 和命令字
-  （`0x05`/`0x06`/`0x84`），没给字段顺序、字节序和校验方式。本工程自行定义了一套，
-  集中在 `src/acg720_protocol.py` **一个文件**里，必须拿 FPGA 源码核对后才能接真车。
-  布局不对的后果是底盘按错误速度跑，而日志上一切正常。
+* ⚠️ **连续导航被固件的 3.0 s 运行上限挡住。** 这不是"还没做"，是"做不了"：
+  `0x02 MOVE` 连续跑满 3.0 秒就会锁存 `FAULT_RUN_LIMIT` 并切断电机使能，
+  只能断电或"松开 S0 再按 S4"复位；而且**重发命令不能续期**。
+  实测确认：即使是 10 Hz 连续重发也一样触顶。
+  今天唯一能真正驱动真车的运动原语是 `0x05 POSITION`（分段走）。
+  需要 FPGA 侧改什么、为什么、怎么验，都写在
+  [`fpga_change_request.md`](src/my_robot_description/docs/fpga_change_request.md) 里 ——
+  **结论是只需要改一处**（运行上限策略），不需要新增协议命令。
 * ⚠️ **两套 URDF 的物理参数都未经实车复核。** 仿真用的
   [`my_robot.urdf.xacro`](src/my_robot_description/urdf/my_robot.urdf.xacro) 是按
   0.4×0.3 底盘估的占位值（含 `wheel_separation_scale = 1.36`、
@@ -230,6 +241,9 @@ docker/run.sh ros2 run my_robot_description platform_check.py
   [`acg720_real.urdf.xacro`](src/my_robot_description/urdf/acg720_real.urdf.xacro)
   按交接包几何填（轮径 65 mm、轮距 200 mm、轴距 185 mm），但同样**未实测**。
   清单与测量方法见 [`real_robot_params.md`](src/my_robot_description/docs/real_robot_params.md)。
+* ⚠️ **板上到底烧的是哪个位流仍未确认**（交接包的两个 `.fs` 只有一个登记了哈希）。
+  固件会在 0x83 遥测里报 `build_id`（当前 `0x20260A02`），驱动的启动路径会校验它，
+  **不符就拒绝一切运动命令** —— 是 fail-safe，但第一次上电时要看一眼启动日志。
 
 > ⚠️ 真机上的 `wheel_separation_scale` **必须重量，不要抄仿真的 1.36**——
 > 那是 ODE 物理引擎 + `wheel_mu_lat=0.5` 的产物，与真车轮胎/地面/负载无关。

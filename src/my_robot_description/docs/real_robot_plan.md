@@ -23,18 +23,24 @@
 三条功能里，**① 起点到终点** 和 **③ 路径点** 搬到真机主要是标定问题；
 **② 障碍物避让** 最麻烦，因为**"零接触"这个结论在真机上没法用现在的工具证明**（见第 4 节）。
 
-> **本次更新：底盘驱动层已经做完了。** 详见
+> **本次更新：底盘驱动层按 FPGA 源码重做完了。** 详见
 > [`acg720_protocol.md`](acg720_protocol.md)。要点：
 >
-> * `acg720_driver` 节点：`/cmd_vel` → 四轮 RPM，编码器计数 → `/odom` + `odom→base_link`
-> * `acg720_simulator`：PTY 虚拟底盘，**没有硬件也能把全链路跑通并验证**
-> * `robot.launch.py`：真机 bringup（驱动 + TF + Nav2，无 Gazebo、无仿真时钟）
-> * `urdf/acg720_real.urdf.xacro`：按交接包几何建的真车 URDF
-> * 测试：54 例纯函数 + 30 项 HIL + 20 项 launch 冒烟
+> * 真协议 V1：`A5 5A | VER | KIND | SEQ | LEN | PAYLOAD | CRC16`，
+>   CRC-16/CCITT-FALSE，7 条命令、5 种遥测。**每条结论都标了 RTL 的 `文件:行号`**，
+>   并与厂商的 `chassis_control.py` 做了逐字节交叉核对。
+> * `acg720_firmware.py`：按 RTL 逐条复刻的**固件行为模型**
+>   （帧拒绝、安全状态机、3.0 s 上限、故障自锁、ACK 单槽、位置环）。
+> * `acg720_driver`：真协议驱动节点，启动即校验位流 `build_id`，故障必吼。
+> * `acg720_simulator`：PTY 虚拟底盘，接上面那个模型，**没有硬件也能撞到真问题**。
+> * 测试：231 例纯函数 + 59 项 HIL + 32 项 launch 冒烟。
 >
-> ⚠ **第一阻塞项**：交接包只给了帧头 `A5 5A` 和命令字，**没有给 payload 字节布局**。
-> 本工程自行定义了一套（集中在 `src/acg720_protocol.py` 一个文件里）。
-> 接真车前必须拿 FPGA 源码核对，否则底盘会按错误速度跑而日志一切正常。
+> ⚠ **第一阻塞项**：**连续导航被固件的 3.0 s 运行上限挡死。**
+> `0x02 MOVE` 连续跑 3.0 秒就锁存 `FAULT_RUN_LIMIT` 并切断使能，
+> 只能断电或"松开 S0 再按 S4"复位；**重发命令不能续期**（10 Hz 重发也一样触顶）。
+> 今天唯一能真正驱动真车的运动原语是 `0x05 POSITION`（分段走）。
+> 需要改什么、为什么、怎么验见
+> [`fpga_change_request.md`](fpga_change_request.md) —— **只需改一处**。
 >
 > ⚠ **第二阻塞项**：雷达型号还没定。用户已确认会加 2D 雷达（LD19 / RPLIDAR A1 级），
 > 但具体型号、驱动包、安装位姿都还没有，所以 `robot.launch.py` 默认
@@ -135,7 +141,7 @@ robot.launch.py
   └── nav.launch.py sim:=false Nav2；use_sim_time 自动为 false
 ```
 
-用法与各参数见 [`acg720_protocol.md`](acg720_protocol.md) 第九节。
+用法与各参数见 [`acg720_protocol.md`](acg720_protocol.md) 第 8 节与第 11 节。
 
 > ⚠ **`odom → base_link` 只能有一个发布者。** 驱动节点发这条；URDF 里
 > **不能**再把它写成关节（真车 URDF 的根是 `base_link`，不是 `odom`）。
@@ -260,14 +266,16 @@ robot.launch.py
 
 | 文件 | 动作 | 状态 |
 |---|---|---|
-| `src/acg720_protocol.py` | **新增**：串口帧编解码 + 运动学换算口径 | ✅ 已做（payload 布局待核实） |
-| `src/drive_kinematics.py` | **新增**：Twist ↔ 四轮 RPM、计数 ↔ 位姿 | ✅ 已做 |
-| `src/acg720_driver.py` | **新增**：底盘驱动节点 | ✅ 已做 |
-| `src/acg720_simulator.py` | **新增**：PTY 虚拟底盘（无硬件验证） | ✅ 已做 |
+| `src/acg720_protocol_v1.py` | **新增**：真协议帧编解码（与厂商实现逐字节交叉核对） | ✅ 已做 |
+| `src/acg720_firmware.py` | **新增**：按 RTL 逐条复刻的固件行为模型 | ✅ 已做 |
+| `src/drive_kinematics.py` | Twist ↔ 四轮 RPM、计数 ↔ 位姿、MOVE 反解 | ✅ 已做 |
+| `src/acg720_driver.py` | **重写**：底盘驱动节点（真协议 V1） | ✅ 已做 |
+| `src/acg720_simulator.py` | **重写**：PTY 虚拟底盘，接固件行为模型 | ✅ 已做 |
+| `docs/fpga_change_request.md` | **新增**：给 FPGA 的变更需求 | ✅ 已做 |
 | `urdf/acg720_real.urdf.xacro` | **新增**：真车 URDF（无 gz 插件/sensor） | ✅ 已做，几何值待实车复核 |
 | `launch/robot.launch.py` | **新增**：真机 bringup | ✅ 已做 |
 | `launch/nav.launch.py` | `use_sim_time` 提成参数；world 校验加条件 | ✅ 已改 |
-| `test/`（三个文件） | **新增**：54 例单测 + 30 项 HIL + 20 项冒烟 | ✅ 已做 |
+| `test/`（五个文件） | 231 例单测 + 59 项 HIL + 32 项冒烟 | ✅ 已做 |
 | `docs/acg720_protocol.md` | **新增**：底盘驱动层文档 | ✅ 已做 |
 | `config/nav2_params.yaml` | **改**：`footprint`、`inflation_radius`、速度/加速度上限、AMCL 雷达参数 | ⏳ 待实车标定 |
 | `config/slam_toolbox.yaml` | **改**：`max_laser_range`、`minimum_time_interval` | ⏳ 待雷达型号确定 |
@@ -296,41 +304,53 @@ robot.launch.py
 
 ## 8. 阻塞项：先确认硬件
 
-原来这里列了五条"不确认就没法动手"的问题。**底盘驱动层现在做完了，所以这份清单
-要重写**——已经答掉的划掉，还挡路的留下。
+原来这里列了五条"不确认就没法动手"的问题。**其中三条已经答掉了**：
+协议布局拿到了 FPGA 源码并逐行核对过；算力平台定了（香橙派 5 Plus +
+Docker 里的 Jazzy）；CPR 也在 RTL 注释里确认了。
 
-### ✅ 已经能动手了（交接包已给出足够信息）
+### ✅ 已经答掉的
 
-* **底盘**：ACG720，四路电机 + 编码器，由 FPGA 做底层闭环。
-  上位机只要按串口协议发目标 RPM、收遥测即可。**不需要写电机 PID。**
-* **接口**：串口（帧头 `A5 5A`，115200），协议与驱动层见
-  [`acg720_protocol.md`](acg720_protocol.md)。
+* **协议布局**：不再是"本工程自行定义"。真协议（含 VER/SEQ/LEN、CRC-16/CCITT-FALSE、
+  7 条命令、5 种遥测）在 [`acg720_protocol.md`](acg720_protocol.md) 里逐条标注了
+  `文件:行号`，并与厂商的 `chassis_control.py` 做了逐字节交叉核对（见
+  `test_protocol_v1.py` 的 4 条活体测试）。
+* **CPR = 1320**：`encoder_quadrature.v:6` 的注释写明
+  "MG520 1:30 为 1320 计数/输出轴一圈，50 ms 测速时 RPM=计数×10/11"。
+  从"1320 计数/圈 + 65 mm 轮径"独立推出的 **0.5 m = 3232 计数**，
+  正好命中交接包示例里的 `POSITION(1, 25, 3232)` —— 两个来源互相印证。
+* **算力平台**：香橙派 5 Plus（RK3588，aarch64）。宿主是 Ubuntu 22.04 的
+  Rockchip BSP 内核，**不改宿主系统**，用 `docker/` 在容器里跑 Noble + Jazzy。
+  板子上已验证：`platform_check.py` 无阻塞项、HIL 30/30、冒烟 20/20。
 
 ### ⛔ 仍然挡路的
 
-1. **payload 字节布局没有权威来源。** 交接包只给了帧头、命令字和周期。
-   本工程自行定义了一套（集中在 `src/acg720_protocol.py`），但**必须拿 FPGA 源码
-   或协议文档核对后才能接真车**。这是**第一阻塞项**：布局不对的后果是底盘按错误
-   速度跑，而日志上一切正常。
-2. **雷达型号 / 驱动包 / 安装位姿都还没有。** 用户已确认会加 2D 雷达
+1. **板上到底烧的是哪个位流。** 交接包含两个 `.fs`，而 `SHA256.txt` **只登记了
+   `23_wifi_car_curve_model.fs`**；`24_wifi_car_position_loop.fs` 没登记。
+   好在固件在 0x83 遥测里报 `build_id`（当前 `0x20260A02`），
+   驱动的启动路径会校验它，不符就**拒绝一切运动命令**（fail-safe，
+   不会按错误口径控制真车）。所以这一条不再需要"上车前盲猜"，
+   但**第一次上电时应该看一眼驱动的启动日志**。
+2. **连续导航被固件的 3.0 s 运行上限挡住。** 这不是"还没做"，
+   是"做不了" —— 需要 FPGA 变更，见
+   [`fpga_change_request.md`](fpga_change_request.md)。
+   现状下唯一能真正驱动真车的运动原语是 `0x05 POSITION`（分段走）。
+3. **雷达型号 / 驱动包 / 安装位姿都还没有。** 用户已确认会加 2D 雷达
    （LD19 / RPLIDAR A1 级），但具体型号未定。`/scan` 是 SLAM 与 AMCL 的前提，
-   所以**没有它就无法验证①③两条功能**。
-   `robot.launch.py` 因此默认 `use_laser:=false` 且不绑定任何型号。
-3. **算力平台还没定。** 目前"用开发机直连"。最终要确认是
-   Jetson / 香橙派 5 Plus / NUC，以及 ROS 2 版本与内存是否够跑 Nav2。
+   所以**没有它就无法验证①③两条功能**。`robot.launch.py` 因此默认
+   `use_laser:=false` 且不绑定任何型号。
 4. **有没有外部真值设备。** 动捕？还是自己搭 AprilTag（天花板相机 + 车顶标签）？
    这决定第 4 节走哪条路线，也决定②"零接触"能不能被证明。
 
 ### 优先级建议
 
 ```
-① 核对 payload 布局（拿 FPGA 源码）      ← 不解决，接车就是盲跑
-② 定雷达型号 + 装好驱动，确认 /scan 出得来  ← 不解决，Nav2/SLAM 无从验证
-③ 底盘台架验证（架空车轮）：方向、急停、/odom 尺度
-     用 robot.launch.py nav:=false
-④ 轮子落地，按 real_robot_params.md 标定 wheel_separation_scale
+① 底盘台架验证（架空车轮）：方向、急停、/odom 尺度、位流版本号
+     用 robot.launch.py nav:=false allow_run_limit:=true
+② 定雷达型号 + 装好驱动，确认 /scan 出得来   ← 不解决，Nav2/SLAM 无从验证
+③ 轮子落地，按 real_robot_params.md 标定 wheel_separation_scale
+④ 决定 FPGA 变更（fpga_change_request.md 的 P0）→ 决定能不能做连续导航
 ⑤ 再谈①②③三条功能的真机复现（需要第 4 节的真值方案）
 ```
 
-**注意 ③④ 现在就能做**，不依赖 ①②：`robot.launch.py` 只起底盘和 TF，
+**注意 ①③ 现在就能做**，不依赖 ②：`robot.launch.py` 只起底盘和 TF，
 不碰雷达也不碰 Nav2。所以"往真机方向推进"的下一步并不被阻塞。

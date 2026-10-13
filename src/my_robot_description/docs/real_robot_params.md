@@ -100,7 +100,7 @@ skid-steer 原地旋转时四个轮子必须横向刮擦，编码器积分出来
 > 仿真里它塞在 `gz-sim-diff-drive-system` 插件的 `<wheel_separation>` 里；
 > 真机没有那个插件，ACG720 的 FPGA 也不知道这个系数（它只有几何轮距）。
 > 所以驱动节点在**下发和上报两侧同时**把 `b_eff = 轮距 × scale` 打进去。
-> 推导见 [`acg720_protocol.md`](acg720_protocol.md) 第三节。
+> 推导见 [`acg720_protocol.md`](acg720_protocol.md) 第 7.3 节。
 >
 > **真车初始值填 `1.0`（不做修正），不要抄仿真表格里的 1.36**——那是
 > ODE 物理引擎 + `wheel_mu_lat=0.5` 的产物，与真车轮胎/地面/负载无关。
