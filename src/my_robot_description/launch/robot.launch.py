@@ -73,8 +73,11 @@ def _launch_setup(context, *args, **kwargs):
     wheelbase = cfg.get('wheelbase_m', '0.185')
     max_linear_vel = cfg.get('max_linear_vel', '0.20')
     max_angular_vel = cfg.get('max_angular_vel', '1.0')
-    max_wheel_rpm = cfg.get('max_wheel_rpm', '40.0')
+    max_base_rpm = cfg.get('max_base_rpm', '200.0')
     cmd_vel_timeout = cfg.get('cmd_vel_timeout', '0.5')
+    control_mode = cfg.get('control_mode', 'move')
+    expected_build_id = cfg.get('expected_build_id', '20260A02')
+    allow_run_limit = str(cfg.get('allow_run_limit', 'false')).lower() in ('true', '1')
     map_yaml = cfg.get('map', '')
     log_level = cfg.get('log_level', 'info')
 
@@ -95,6 +98,12 @@ def _launch_setup(context, *args, **kwargs):
 
     actions = []
 
+    actions.append(LogInfo(msg=(
+        '★ 固件限制：连续运动（0x02 MOVE）最多 3.0 s 就会锁存 FAULT_RUN_LIMIT，'
+        '之后只能断电或「松开 S0 再按 S4」复位。任何一次串口中断超过 300 ms '
+        '（命令超时）也会同样锁死。连续导航需要 FPGA 变更，'
+        '详见 docs/fpga_change_request.md。')))
+
     # ---- 1. 底盘驱动 ----
     actions.append(Node(
         package='my_robot_description',
@@ -113,9 +122,14 @@ def _launch_setup(context, *args, **kwargs):
             'wheel_separation_scale': float(scale),
             'max_linear_vel': float(max_linear_vel),
             'max_angular_vel': float(max_angular_vel),
-            'max_wheel_rpm': float(max_wheel_rpm),
-            'min_wheel_rpm': -float(max_wheel_rpm),
+            # 固件对 0x02 MOVE 的 base_rpm 上限（chassis_command_rx.v:99）
+            'max_base_rpm': float(max_base_rpm),
             'cmd_vel_timeout': float(cmd_vel_timeout),
+            'control_mode': control_mode,
+            # ★ 位流版本号：不符就拒绝一切运动命令（烧错位流时 fail-safe）
+            'expected_build_id': expected_build_id,
+            # ★ 连续运动 3.0 s 后固件会锁死；真实串口上必须显式确认
+            'allow_run_limit': allow_run_limit,
             # 真机时钟：不是仿真时间
             'use_sim_time': False,
         }],
@@ -241,11 +255,25 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'max_angular_vel', default_value='1.0', description='最大角速度 rad/s'),
         DeclareLaunchArgument(
-            'max_wheel_rpm', default_value='40.0',
-            description='单轮最大 RPM。协议取值范围 8–40'),
+            'max_base_rpm', default_value='200.0',
+            description='0x02 MOVE 的 base_rpm 上限（固件 chassis_command_rx.v:99）。'
+                        '注意与 0x05 POSITION 的 8–40 RPM 不是一回事'),
         DeclareLaunchArgument(
             'cmd_vel_timeout', default_value='0.5',
             description='/cmd_vel 超时停车时间 s'),
+        DeclareLaunchArgument(
+            'control_mode', default_value='move',
+            description="控制模式。目前只实现 'move'（主机侧把 (v, ω) 反解成 "
+                        "0x02 MOVE）；基于 0x05 POSITION 的分段导航是独立的一期工作"),
+        DeclareLaunchArgument(
+            'expected_build_id', default_value='20260A02',
+            description='★ 期望的位流版本号（0x83 遥测里的 build_id）。不符就拒绝'
+                        '一切运动命令。空串 = 不校验'),
+        DeclareLaunchArgument(
+            'allow_run_limit', default_value='false',
+            description='★ 真实串口上的安全闸：连续运动 3.0 s 后固件会锁存 '
+                        'FAULT_RUN_LIMIT（只能断电/按 S4 复位）。确认是在台架上做'
+                        '验证再置 true'),
         DeclareLaunchArgument(
             'params_file', default_value='',
             description='Nav2 参数文件。默认用**真车**参数 '

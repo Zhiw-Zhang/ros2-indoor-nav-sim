@@ -45,8 +45,8 @@ install(FILES
   DESTINATION share/${PROJECT_NAME}/launch
 )
 install(FILES
-  src/acg720_protocol.py
   src/acg720_protocol_v1.py
+  src/acg720_firmware.py
   src/drive_kinematics.py
   DESTINATION lib/${PROJECT_NAME}
 )

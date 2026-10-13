@@ -119,8 +119,8 @@ def main():
     # ---- 前置检查：install 里的文件与可执行位 ----
     print('\n[0] install 产物检查')
     libdir = os.path.join(WS, 'install/my_robot_description/lib/my_robot_description')
-    for f in ('acg720_driver.py', 'acg720_simulator.py', 'acg720_protocol.py',
-              'drive_kinematics.py'):
+    for f in ('acg720_driver.py', 'acg720_simulator.py', 'acg720_protocol_v1.py',
+              'acg720_firmware.py', 'drive_kinematics.py'):
         p = os.path.join(libdir, f)
         exists = os.path.exists(p)
         executable = os.access(p, os.X_OK)
@@ -221,15 +221,26 @@ def main():
     before = run_ros(env, ['ros2', 'topic', 'echo', '/odom', '--once'], timeout=20)
     x0 = pos_x(before)
 
+    # ★ 只跑 1.5 s：固件的连续运动上限是 3.0 s，跑久了会锁死底盘
+    #   （那属于"固件已知限制"，不是连通性问题 —— 它由 HIL 测试专门覆盖）。
     pub = Proc(['ros2', 'topic', 'pub', '--rate', '20', '/cmd_vel',
                 'geometry_msgs/msg/Twist', '{linear: {x: 0.1}}'],
                '/tmp/smoke_pub.log', env=env)
-    time.sleep(2.5)
-    # 趁指令还在发的时候读诊断：诊断是 1 Hz 快照，且反映的是**当下**状态
-    diag = run_ros(env, ['ros2', 'topic', 'echo', '/acg720/diagnostics', '--once'],
-                   timeout=15)
-    after = run_ros(env, ['ros2', 'topic', 'echo', '/odom', '--once'], timeout=20)
+    time.sleep(1.0)
+    # ★ 先停发布器，再读诊断/里程计。
+    #   一次 `ros2 topic echo --once` 要花 1~3 秒，如果这段时间里还在发速度，
+    #   车就连续 RUNNING 超过 3.0 s → 撞上固件的连续运动上限而锁死，
+    #   于是后面的断言全都在测"锁死之后的行为"。**本项目真的踩过这一条**。
     pub.kill()
+    # 停发后驱动会在 cmd_vel_timeout 内下发 STOP，所以状态是 ARMED_STOP；
+    # 诊断是 1 Hz 快照，读到的就是当下状态。
+    # ★ 必须显式放大 `--truncate-length`！`ros2 topic echo` 默认只打 128 个字符
+    #   就截断加 "..."，而诊断串有 270+ 字符 —— 于是 `crc_errors=` 后面的字段
+    #   永远读不到，断言会以"字段不存在"的形式**假失败**。
+    #   （本项目真的被它骗过一次：以为 CRC 一直在错。）
+    diag = run_ros(env, ['ros2', 'topic', 'echo', '--truncate-length', '100000',
+                         '/acg720/diagnostics', '--once'], timeout=15)
+    after = run_ros(env, ['ros2', 'topic', 'echo', '/odom', '--once'], timeout=20)
     x1 = pos_x(after)
 
     res.check('发出速度后里程计前进', x0 is not None and x1 is not None and x1 > x0 + 0.01,
@@ -237,10 +248,31 @@ def main():
     m = re.search(r'cmds=(\d+)', diag)
     res.check('驱动收到的指令数 > 0', bool(m) and int(m.group(1)) > 0,
               f'cmds={m.group(1)}' if m else '诊断里没有 cmds 字段')
-    res.check('无 CRC 错误',
-              'crc_errors=0' in diag,
-              re.search(r'crc_errors=\d+', diag).group(0) if 'crc_errors=' in diag else '')
+    # ★ 两个 CRC 计数要分开看：
+    #     crc_errors    = 我们（驱动）收到的坏帧
+    #     fw_crc_errors = 固件收到的坏帧
+    #   只报一个数会把排查方向带偏，所以两边都断言，且都要求为 0。
+    m = re.search(r'(?<!fw_)crc_errors=(\d+)', diag)
+    res.check('驱动侧无 CRC 错误', m is not None and int(m.group(1)) == 0,
+              m.group(0) if m else '诊断里没有 crc_errors 字段')
+    m = re.search(r'fw_crc_errors=(\d+)', diag)
+    res.check('固件侧无 CRC 错误', m is not None and int(m.group(1)) == 0,
+              m.group(0) if m else '诊断里没有 fw_crc_errors 字段')
     res.check('诊断话题可用', 'connected=True' in diag, diag.strip()[:140])
+    # ★ 状态机必须真的起来了（位流校验 + ARM 握手走通）。
+    #   只看"车动了"不够：DISARMED 下命令会被**静默忽略**，
+    #   而 odom 会因为别的原因抖动 —— 那是最难查的一类"看起来正常"。
+    # 诊断是 1 Hz/按需快照：读它的那 ~1 秒里车可能已经被 cmd_vel 超时停下来了，
+    # 所以 RUNNING 与 ARMED_STOP 都算"状态机确实起来了"。
+    # 真正不能出现的是 DISARMED（那意味着 ARM 握手没成功，而 DISARMED 下
+    # 非 ARM 命令会被固件**静默忽略** —— 最难查的一类"看起来正常"）。
+    res.check('底盘安全状态机已使能（RUNNING/ARMED_STOP）',
+              'state=RUNNING' in diag or 'state=ARMED_STOP' in diag,
+              re.search(r'state=\w+', diag).group(0) if 'state=' in diag else '诊断里没有 state 字段')
+    res.check('位流版本号已读到', 'build_id=0x20260A02' in diag,
+              re.search(r'build_id=\S+', diag).group(0) if 'build_id=' in diag else '')
+    res.check('底盘没被锁死', 'fault=NONE' in diag,
+              re.search(r'fault=\w+', diag).group(0) if 'fault=' in diag else '')
 
     # ---- 停下来：cmd_vel 停发后必须自动停车 ----
     print('\n[5] 停发 /cmd_vel 后自动停车')
