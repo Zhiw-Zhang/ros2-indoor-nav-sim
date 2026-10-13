@@ -46,6 +46,7 @@ install(FILES
 )
 install(FILES
   src/acg720_protocol.py
+  src/acg720_protocol_v1.py
   src/drive_kinematics.py
   DESTINATION lib/${PROJECT_NAME}
 )
