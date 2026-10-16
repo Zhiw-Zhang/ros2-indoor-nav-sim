@@ -20,9 +20,11 @@
 #   4. --network host 和 --ipc host 都是必须的：
 #        host 网络 → DDS 才能和宿主上、乃至别的机器上的节点互相发现
 #        host IPC  → FastDDS 的共享内存传输需要在 /dev/shm 上对齐
-#   5. **不挂 /dev，也不加 --privileged。** 目前 HIL 测试用的是容器**内部**
-#      的 PTY，不需要真串口。以后接底盘串口时再加 --device，并且要用 udev
-#      把设备名固定住 —— 见 docker/README.md 末尾。
+#   5. **默认不挂 /dev，也不加 --privileged。** 仿真的 HIL 测试用的是容器
+#      **内部**的 PTY，不需要真串口，所以默认什么都不挂 —— 能不加就不加。
+#      要接真底盘时用 `ACG720_DEVICE=/dev/xxx` 显式指定（见下面的 DEV_ARGS）。
+#      **不要**为了图省事改成 `-v /dev:/dev` 或 `--privileged`：
+#      那等于把整个 /dev 交给容器，代价远大于收益。详见 docker/README.md 末尾。
 # ============================================================================
 set -euo pipefail
 
@@ -57,16 +59,51 @@ else
   TTY=(-i)
 fi
 
+# ── 真串口（可选）────────────────────────────────────────────────────────
+# 默认一个设备都不挂。要接 ACG720 底盘时：
+#
+#     ACG720_DEVICE=/dev/acg720 docker/run.sh ros2 run my_robot_description acg720_driver.py
+#
+# 推荐先用 udev 把设备名固定住（见 docker/README.md 末尾），别直接写
+# /dev/ttyUSB0 —— 那个号会随插入顺序变，而且等到两条规则打架时才知道疼。
+# 这段放在镜像检查**之前**：参数写错要立刻报错，别让人先等镜像检查。
+DEV_ARGS=()
+if [ -n "${ACG720_DEVICE:-}" ]; then
+  if [ ! -e "${ACG720_DEVICE}" ]; then
+    echo "ACG720_DEVICE=${ACG720_DEVICE} 不存在（还没插，或者名字不对）。" >&2
+    echo "当前宿主上的串口设备：" >&2
+    ls -l /dev/ttyUSB* /dev/ttyACM* 2>/dev/null >&2 || echo "    （一个都没有）" >&2
+    exit 1
+  fi
+  DEV_ARGS+=(--device "${ACG720_DEVICE}")
+
+  # ★ 光有 --device 是不够的。`--user uid:gid` 只映射**主**组，宿主的
+  #   **补充组不会带进容器**。而 /dev/ttyUSB* 通常是 root:dialout 0660，
+  #   宿主用户正是靠 dialout 这个补充组才读得到的 —— 容器里没有这个组，
+  #   打开设备就会 Permission denied（而且报错发生在驱动里，很容易误判成
+  #   "串口配置错了"）。这里把设备节点的 gid 直接 --group-add 进去，
+  #   不去猜组名（组名在别的发行版上不一定叫 dialout）。
+  DEV_GID="$(stat -c '%g' "${ACG720_DEVICE}")"
+  if [ "${DEV_GID}" != "0" ]; then
+    DEV_ARGS+=(--group-add "${DEV_GID}")
+  fi
+fi
+
 if ! "${DOCKER[@]}" image inspect "${IMAGE}" >/dev/null 2>&1; then
   echo "找不到镜像 ${IMAGE}，先构建一次：" >&2
   echo "    $0 --build" >&2
   exit 1
 fi
 
+# ⚠️ 设备节点是在 `docker run` 那一刻拿到的：**USB 拔插之后必须重启容器**。
+#    想避免这点就得 `-v /dev:/dev`，代价见文件头第 5 条。所以请把 udev 规则
+#    一次配对，别养成运行中拔插的习惯。
+
 exec "${DOCKER[@]}" run --rm "${TTY[@]}" \
   --network host \
   --ipc host \
   --user "${HOST_UID}:${HOST_GID}" \
+  "${DEV_ARGS[@]}" \
   -e HOME=/tmp \
   -e ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}" \
   -v "${WS}:/ws" \

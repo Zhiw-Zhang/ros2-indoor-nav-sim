@@ -67,21 +67,89 @@ docker/run.sh python3 src/my_robot_description/test/test_hil_end_to_end.py
 
 ---
 
-## 以后要接底盘串口时
+## 接真底盘串口
 
-现在的 HIL 测试用的是容器**内部**的 PTY（`os.openpty()`），**不需要**真串口，
-所以 `run.sh` 现在不挂 `/dev`、也不加 `--privileged` —— 这两样能不加就不加。
+仿真的 HIL 测试用的是容器**内部**的 PTY（`os.openpty()`），**不需要**真串口。
+所以 `run.sh` 默认一个设备都不挂，**默认行为对仿真流程零影响**。
 
-等真要接 ACG720 串口了，先确认芯片号：
+要接 ACG720 的真串口时，用环境变量显式指定设备节点：
 
 ```bash
+ACG720_DEVICE=/dev/acg720 docker/run.sh ros2 run my_robot_description acg720_driver.py
+```
+
+`run.sh` 会自动做两件事：
+
+1. 加 `--device <节点>`（只挂这一个设备，不是整个 `/dev`）；
+2. **把设备节点的 gid `--group-add` 进容器**。
+
+第 2 条不是可选项。`--user uid:gid` 只映射**主组**，宿主的**补充组不会
+带进容器**；而 `/dev/ttyUSB*` 通常是 `root:dialout 0660`，宿主用户正是靠
+`dialout` 这个补充组才读得到的。少了这一步，容器里打开设备会 `Permission
+denied`，而报错发生在驱动内部，很容易被误判成"串口配置错了"。
+（脚本是直接取 `stat -c %g` 的结果，不去猜组名 —— 换个发行版组名不一定
+叫 `dialout`。）
+
+### 先把设备名固定下来
+
+别在命令里写 `/dev/ttyUSB0`：这个号会随插入顺序变。先确认识别情况：
+
+```bash
+ls -l /dev/ttyUSB*                          # 插上转接板后应当多出一个
 udevadm info -a -n /dev/ttyUSB0 | grep -m2 -E 'idVendor|idProduct'
 ```
 
-然后写一条 udev 规则把设备名固定成 `/dev/acg720`（`SYMLINK+="acg720"`、
-`GROUP="dialout"`、`MODE="0660"`），再在 `run.sh` 里加一行
-`--device /dev/acg720`。
+再写一条 udev 规则（`/etc/udev/rules.d/99-acg720.rules`），把芯片号换成
+上面查到的值：
 
-> 注意：容器是在启动那一刻拿设备节点的。**拔插 USB 之后必须重启容器**
-> 才会重新拿到设备；不想重启就得 `--privileged -v /dev:/dev`，代价是把整个
-> `/dev` 交给容器。所以规则要一次配对，别养成拔插的习惯。
+```
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
+  SYMLINK+="acg720", GROUP="dialout", MODE="0660"
+```
+
+然后 `sudo udevadm control --reload && sudo udevadm trigger`，确认
+`/dev/acg720` 出现。
+
+> ⚠️ **容器是在 `docker run` 那一刻拿设备节点的。USB 拔插之后必须重启容器**
+> 才会重新拿到。不想重启就得 `-v /dev:/dev`，那等于把整个 `/dev` 交给容器，
+> 代价远大于收益。所以规则要一次配对，别养成运行中拔插的习惯。
+
+### 接线
+
+取材自交接包的 `navigation/docs/HARDWARE.md`（**这个文件在交接包里，不在本
+仓库**，所以这里直接抄下来，免得留一个点不开的路径）：
+
+| 转接板 | FPGA | 说明 |
+|---|---|---|
+| USB-TTL **TX** | `E17`（`uart_rxd`） | 3.3 V 逻辑 |
+| USB-TTL **RX** | `C20`（`uart_txd`） | |
+| **GND** | FPGA `GND` | **必须共地**，否则字节会随机出错 |
+
+⚠️ 电平必须是 **3.3 V**。很多 USB-TTL 板子有 5V/3.3V 跳线，务必确认在
+3.3 V 档 —— FPGA 的 IO 是按 3.3 V 逻辑设计的。
+
+> 顺带说明：这里走的是**外接 USB 转接板**，不是板子自己的调试串口，
+> 所以 `console=ttyS2` 那条内核命令行参数**不冲突**，不用去动 `cmdline.txt`。
+
+### 第一次接通时按这个顺序验
+
+```bash
+# 1) 宿主上确认设备在
+ls -l /dev/acg720
+
+# 2) 容器里能看到、能打开（不跑 ROS，先排除权限问题）
+ACG720_DEVICE=/dev/acg720 docker/run.sh \
+  python3 -c "import serial; s=serial.Serial('/dev/acg720',115200,timeout=1); print('打开成功', s.name); s.close()"
+
+# 3) 起驱动，看位流版本号
+ACG720_DEVICE=/dev/acg720 docker/run.sh \
+  ros2 run my_robot_description acg720_driver.py --ros-args -p port:=/dev/acg720
+```
+
+第 3 步的日志里会出现 `位流版本校验通过：build_id=0x20260A02`。
+**如果报"位流版本不符"，先别往下走** —— 多半是烧的是曲线模型那版位流，
+这时驱动会拒绝发送任何运动命令（这是设计好的保护，不是故障）。
+
+> 轮子上的测试务必**离地**。固件的 3.0 s 连续运动上限和 300 ms 命令超时
+> 都会在台架上真实生效：任何一个没预期到就会锁存 FAULT，而 FAULT 是自锁的，
+> 只能断电或「松开急停 S0 再按 S4」复位。

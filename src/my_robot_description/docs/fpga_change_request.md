@@ -15,7 +15,7 @@
 
 | 优先级 | 变更 | 一句话理由 | 不改的后果 |
 |---|---|---|---|
-| **P0** | 重新设计 `RUN_LIMIT`（3.0 s 连续运动上限）策略 | 它是**唯一**挡住连续导航的东西；而 300 ms 命令超时**已经**是防跑飞的 deadman，3 s 上限是冗余的 | 连续闭环导航**永远做不了**，只能"分段走走停停" |
+| **P0** | 重新设计 `RUN_LIMIT`（3.0 s 连续运动上限）策略 | 它是**唯一**挡住连续导航的东西；而 300 ms 命令超时**已经**是防跑飞的 deadman，3 s 上限是冗余的 | 连续 `MOVE` 闭环**永远做不了**；只能改用位置段分段导航兜底（见 7.3） |
 | P1 | 允许内侧轮**反转**（或给内/外轮独立符号） | 现在内侧轮只能"按比例缩小" | 转弯半径 < 半轮距的急弯、以及**倒车转弯**不可达 |
 | P2 | 新增 `0x07 VELOCITY` | **建议不做**（见第 4 节）：现有 `0x02 MOVE` 已能表达绝大多数 (v, ω)，而且 `INTERFACE.md` 的草案会被现有解析器直接拒绝 | —— |
 | 文档 | 统一 `INTERFACE.md` 的 LEN 上限（48 vs 实际 8） | 草案按现状发出去会**锁死底盘** | 照草案实现的人一定会踩 |
@@ -23,6 +23,14 @@
 **一句话**：只要做 P0 这一处，上位机侧**已经写好**的连续控制就能立刻用起来
 （`(v, ω)` → `0x02 MOVE` 的反解已经实现并测试过）。
 P1 是"能做多灵活"的问题，不是"能不能做"的问题。
+
+> **但有一个重要例外**：`POSITION`（`0x05`）模式**不受 3.0 s 上限约束**
+> —— 判据里的 `!position_active`（`:57-58`）。所以在上位机侧把长距离拆成
+> 一串位置段，**不改固件也能实现连续导航**。
+> 这条路径成立的原因非常微妙（靠一个分支的先后顺序，见 **7.3**），
+> 而且它**不是**"走走停停凑合"：每段结束时底盘只回到 `ARMED_STOP`，
+> 不锁死、不需要人工复位，段与段之间可以直接接着发。
+> 它是 P0 落地之前的正经替代方案。
 
 ---
 
@@ -107,6 +115,11 @@ assign run_limit_reached = active_open_loop && !position_active &&
 
 **不推荐**：把上限从 3 s 改大（比如 30 s）。那只是把"走到一半锁死"推迟到
 "走到一半锁死"，问题不变，还削弱了原本的安全裕度。
+
+> ⚠️ **无论采用哪种改法，都千万不要动** `internal_stop` 与 `run_limit_reached`
+> 两个分支的**先后顺序**，也不要顺手把 `!position_active` 去掉。
+> 那是"位置段能跑超过 3 s"的**唯一**依据，理由见 7.3 —— 很容易在重构时
+> 无意破坏，而破坏后的现象极难定位。
 
 ### 2.5 改动后的验证方法
 
@@ -264,7 +277,7 @@ python3 src/my_robot_description/test/test_hil_end_to_end.py
 
 ---
 
-## 7. 顺带发现的两处（不是变更请求，是提醒）
+## 7. 顺带发现的三处（不是变更请求，是提醒）
 
 1. **`chassis_telemetry_tx.v` 是遗留文件，`top.v` 实例化的是
    `chassis_telemetry_imu_tx.v`**（`:342`）。两份文件长得像，
@@ -276,6 +289,72 @@ python3 src/my_robot_description/test/test_hil_end_to_end.py
    所以 `command_stop_target` 恒为真。功能上无害（只是死代码），
    但**别把它当成一条可用的保护**：真正的保护是"ARM 只在 DISARMED 下被接受"。
    上位机侧我们已经按"ARM 只发一次、绝不重发"实现。
+3. ★★ **`chassis_safety_fsm.v` 里 `internal_stop` 与 `run_limit_reached`
+   这两个分支的先后顺序是"承重"的 —— 改 P0 时最容易踩坏的就是它。**
+
+   先看判据（`:57-58`）：
+
+   ```verilog
+   assign run_limit_reached = !position_active &&
+                              (run_age >= RUN_LIMIT_CYCLES - 32'd1);
+   ```
+
+   再看 `run_age` 的累加条件（`:74-77`）——**它只在 `state != RUNNING` 时清零**：
+
+   ```verilog
+   always @(posedge clk or negedge reset_n) begin
+       if (!reset_n || (state != STATE_RUNNING))
+           run_age <= 32'd0;
+       else if (!run_limit_reached)
+           run_age <= run_age + 32'd1;
+   end
+   ```
+
+   把这两段合起来看，就能推出一个反直觉的结论：**位置移动期间 `run_age`
+   照常累加，一路加过 3.0 s 也不会停**（因为 `run_limit_reached` 被
+   `!position_active` 压成了假，累加分支一直成立）。也就是说，
+   **一个超过 3.0 s 的位置段走完的那一刻，`run_age` 早就爆表了**，
+   `run_limit_reached` 会在同一拍立刻变真。
+
+   它之所以**没有**跳 `FAULT_RUN_LIMIT`，唯一的原因是判断的先后顺序：
+
+   ```verilog
+   end else if ((state == STATE_RUNNING) && internal_stop) begin      // :91 先判
+       state        <= STATE_ARMED_STOP;
+       fault_reason <= FAULT_NONE;
+   end else if ((state == STATE_RUNNING) && run_limit_reached) begin  // :95 后判
+       state        <= STATE_FAULT;
+       fault_reason <= FAULT_RUN_LIMIT;
+   end
+   ```
+
+   而位置环的每一条结束路径（正常走完 / 超时 / 堵转 / 被拒）都把
+   `busy <= 1'b0` 和 `internal_stop_pulse <= 1'b1` 写在**同一个分支**里：
+
+   | 结束原因 | 出处 |
+   |---|---|
+   | 起步参数被拒 | `chassis_position_controller.v:199-205` |
+   | 超时 | `:222-225` |
+   | 堵转 | `:236-239` |
+   | 正常走完（SETTLE 结束） | `:254-258` |
+
+   两者都是非阻塞赋值，所以在 `position_active` 由 1 变 0 的那一拍，
+   `internal_stop` **一定同时**为 1，`:91` 抢在 `:95` 前面把状态带去
+   `ARMED_STOP`，`run_age` 随即被清零。**这是在一条极细的缝上走对了。**
+
+   由此有两条硬约束：
+
+   * **别把 `:95` 挪到 `:91` 前面**，也别把 `run_limit_reached` 改成不排除
+     `position_active`。一旦改动，**每一个超过 3 s 的位置段都会在到达目标的
+     那一瞬间锁死底盘**，现象是"车明明走到位了却报 `RUN_LIMIT`"，
+     而且只在长距离时复现 —— 极难定位。
+   * 位置环新增任何结束路径时，**必须**同样成对地写
+     `busy <= 1'b0` 与 `internal_stop_pulse <= 1'b1`。漏掉 `internal_stop_pulse`
+     就等于同时踩中"`run_age` 不清零"和"位流状态机停在 RUNNING"两个坑。
+
+   > 附带说明：正因为这条顺序存在，**上位机用"位置环分段导航"（把长距离拆成
+   > 一串 `0x05 POSITION`）在当前位流上就能实现连续导航，不必等 P0 落地**。
+   > 这条路径能成立完全是靠上面的时序，所以它同样是"改 RTL 前必须知道"的事。
 
 ---
 
@@ -283,9 +362,11 @@ python3 src/my_robot_description/test/test_hil_end_to_end.py
 
 ```
 [ ] P0  决定 RUN_LIMIT 怎么改（推荐：删掉判据，只留 300 ms 命令超时）
+[ ] P0  改 RTL 时**保住** `:91`/`:95` 的分支顺序与 `!position_active`（见 7.3）
 [ ] P0  改完跑一遍无硬件验证（第 5 节三条命令），确认"3.0 s 上限"相关的断言按预期翻转
 [ ] P0  在台架上跑"同一段 /cmd_vel 跑 10 秒"的前后对比（2.5 节表格）
 [ ] 文档 把 INTERFACE.md 的 LEN 上限从 48 改成 8，并标注 0x07/0x85 尚未分配
 [ ] P1  （可选）给内侧轮加符号位
 [ ] P2  （不需要）0x07 VELOCITY
+[ ] 替代方案（不改固件）：上位机做"位置段分段导航"，见 7.3 末尾
 ```
