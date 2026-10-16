@@ -196,7 +196,7 @@ ros2 launch my_robot_description robot.launch.py port:=/dev/pts/N nav:=false
 每条结论都标了 `文件:行号`，并与厂商的 `chassis_control.py` 做了逐字节交叉核对。
 细节见 [`acg720_protocol.md`](src/my_robot_description/docs/acg720_protocol.md)。
 
-验证规模：**231 例纯函数单测 + 59 项 HIL 集成测试 + 32 项 launch 冒烟测试**，
+验证规模：**231 例纯函数单测 + 59 项 HIL 集成测试 + 33 项 launch 冒烟测试**，
 含 skid-steer 标定闭环（`θ_odom/θ_true` 从 1.36 收到 1.00）、
 "非法帧会锁死底盘"、"连续运动 3.0 s 后锁死并如实上报"等真固件行为。
 
