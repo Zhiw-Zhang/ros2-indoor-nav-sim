@@ -38,8 +38,11 @@ git -C ~/sim_nav_ws log -1 --oneline     # 把这个 commit 发给软件侧确�
 ```bash
 cd ~/sim_nav_ws
 
-# ① 只构建一次（第一次或改了 CMakeLists/新增文件时）
-./docker/run.sh --build
+# ① 构建镜像（只第一次）+ 构建工作空间
+./docker/run.sh --build                        # 镜像，只做一次（慢）
+./docker/run.sh colcon build --symlink-install  # 工作空间
+#    ⚠ 新增/改名文件后**必须重跑** colcon build：install/ 里是按**文件**
+#      建的符号链接，不重跑就会出现"脚本明明在，ros2 run 找不到"。
 
 # ② 平台自检：内核/容器/ROS/依赖/串口与 PTY/启动参数/CPU/网络
 ./docker/run.sh ros2 run my_robot_description platform_check.py
@@ -56,6 +59,13 @@ cd ~/sim_nav_ws
 # 全部单测（板上应当是 344 passed / 5 skipped；5 项跳过是设计好的，
 # 它们要交接包的厂商文件，那包不在这台机器上）
 ./docker/run.sh python3 -m pytest src/my_robot_description/test
+```
+
+含硬件体检的三个脚本也可以先"空跑"确认脚本本身没问题：
+
+```bash
+./docker/run.sh ros2 run my_robot_description scan_check.py --selftest
+./docker/run.sh ros2 run my_robot_description acg720_simulator.py --dry-run
 ```
 
 > 容器怎么起的、为什么要 `--network host --ipc host`、真串口怎么进去，
