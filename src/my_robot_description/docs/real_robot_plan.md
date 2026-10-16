@@ -34,7 +34,7 @@
 > * `acg720_driver`：真协议驱动节点，启动即校验位流 `build_id`，故障必吼。
 > * `acg720_simulator`：PTY 虚拟底盘，接上面那个模型，**没有硬件也能撞到真问题**。
 > * `position_segments.py`：**分段导航**的规划器与执行状态机（纯逻辑）。
-> * 测试：349 例纯函数 + 59 项 HIL + 65 项分段导航 HIL + 33 项 launch 冒烟。
+> * 测试：349 例纯函数 + 59 项 HIL + 65 项分段导航 HIL + 32 项 launch 冒烟。
 >
 > ⚠ **第一阻塞项已降级为"性能问题"**：固件的 3.0 s 运行上限挡的是
 > **连续的 `0x02 MOVE`**（跑满 3.0 秒就锁存 `FAULT_RUN_LIMIT`，只能断电或
@@ -282,7 +282,7 @@ robot.launch.py
 | `urdf/acg720_real.urdf.xacro` | **新增**：真车 URDF（无 gz 插件/sensor） | ✅ 已做，几何值待实车复核 |
 | `launch/robot.launch.py` | **新增**：真机 bringup | ✅ 已做 |
 | `launch/nav.launch.py` | `use_sim_time` 提成参数；world 校验加条件 | ✅ 已改 |
-| `test/`（七个文件） | 349 例单测 + 59 项 HIL + 65 项分段导航 HIL + 33 项冒烟 | ✅ 已做 |
+| `test/`（七个文件） | 349 例单测 + 59 项 HIL + 65 项分段导航 HIL + 32 项冒烟 | ✅ 已做 |
 | `docs/acg720_protocol.md` | **新增**：底盘驱动层文档 | ✅ 已做 |
 | `config/nav2_params.yaml` | **改**：`footprint`、`inflation_radius`、速度/加速度上限、AMCL 雷达参数 | ⏳ 待实车标定 |
 | `config/slam_toolbox.yaml` | **改**：`max_laser_range`、`minimum_time_interval` | ⏳ 待雷达型号确定 |
@@ -327,8 +327,12 @@ Docker 里的 Jazzy）；CPR 也在 RTL 注释里确认了。
   正好命中交接包示例里的 `POSITION(1, 25, 3232)` —— 两个来源互相印证。
 * **算力平台**：香橙派 5 Plus（RK3588，aarch64）。宿主是 Ubuntu 22.04 的
   Rockchip BSP 内核，**不改宿主系统**，用 `docker/` 在容器里跑 Noble + Jazzy。
-  板子上已验证：`platform_check.py` 无阻塞项、`pytest` 226 passed/5 skipped、
-  HIL 59/59、冒烟 33/33。
+  板子上已验证（2026-10-16，`ros:jazzy-ros-base` 容器内）：`platform_check.py`
+  无阻塞项、`pytest` 344 passed / 5 skipped（5 项厂商交叉核对按设计跳过 ——
+  交接包不在板上）、4A 分段导航 HIL 65/65、运动模式 HIL 59/59。
+  冒烟测试第一次在板上跑**暴露了测试自己的一个竞态**（`ros2 topic pub` 默认
+  不等订阅端匹配就开发，慢平台上 1.2 s 窗口会被 DDS 发现吃光），已修，
+  修完的板子复跑结果见 `test_bringup_smoke.py` 自报的项数。
 
 ### ⛔ 仍然挡路的
 

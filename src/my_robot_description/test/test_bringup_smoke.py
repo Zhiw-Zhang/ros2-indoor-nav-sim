@@ -63,9 +63,17 @@ class Proc:
         except OSError:
             return ''
 
-    def kill(self):
+    def kill(self, force=False):
+        """整组杀干净。`force=True` 直接 SIGKILL（用在"必须在某一刻停住"的场合）。
+
+        ★ 为什么需要 force：`ros2 topic pub` 收到 SIGINT 后 rclpy 走优雅关闭，
+          在慢平台上可能拖上一两秒 —— 而这一两秒里它**还在发 /cmd_vel**，
+          车就还在 RUNNING。段 4 的窗口是掐着固件 3.0 s 上限留的余量，
+          不能让"退出有多快"变成一个不可控变量。
+        """
+        sig = signal.SIGKILL if force else signal.SIGINT
         try:
-            os.killpg(os.getpgid(self.p.pid), signal.SIGINT)
+            os.killpg(os.getpgid(self.p.pid), sig)
             self.p.wait(timeout=10)
         except Exception:
             try:
@@ -93,8 +101,14 @@ def source_env():
 class Results:
     def __init__(self):
         self.failed = []
+        # ★ 项数由脚本自己数并打出来，**不要**在 README/文档里手写。
+        #   手写的数字已经错过一次（文档写 33，实际 32）：加了检查忘了改，
+        #   或者改了忘了一致 —— 这类"文档说 X 项、跑出来 Y 项"的漂移没有任何
+        #   检查能发现，只能从源头消掉。
+        self.total = 0
 
     def check(self, name, ok, detail=''):
+        self.total += 1
         print(f"  {'✓' if ok else '✗'} {name}" + (f"  {detail}" if detail else ''))
         if not ok:
             self.failed.append(name)
@@ -233,9 +247,21 @@ def main():
     before = run_ros(env, ['ros2', 'topic', 'echo', '/odom', '--once'], timeout=20)
     x0 = pos_x(before)
 
-    # ★ 只跑 1.5 s：固件的连续运动上限是 3.0 s，跑久了会锁死底盘
+    # ★ 运动窗口只有 1.2 s（下面 sleep 那里），固件的连续运动上限是 3.0 s：
+    #   余量是留给"停发布器 + 读诊断"这两步的，跑久了会锁死底盘
     #   （那属于"固件已知限制"，不是连通性问题 —— 它由 HIL 测试专门覆盖）。
-    pub = Proc(['ros2', 'topic', 'pub', '--rate', '20', '/cmd_vel',
+    # ★★ `-w 1` 不是可选项，是这条测试能不能信的前提。
+    #   `ros2 topic pub` 的 `--wait-matching-subscriptions` 默认值在
+    #   **不带 --once/--times 时是 0**（ros2topic/verb/pub.py：
+    #   `int(times != 0)`）—— 也就是说它打印完 `beginning loop` 就立刻开始发，
+    #   **不等订阅端被匹配上**。于是这里有一个静默的竞态：
+    #   下面的 1.2 s 窗口有可能整个被 DDS 端点发现吃掉，驱动一条 /cmd_vel
+    #   都没收到 —— odom 纹丝不动（精确的 0.0），而诊断里 cmds 照常有值
+    #   （全是空闲心跳），看起来像"驱动不响应 /cmd_vel"。
+    #   开发机上发现比窗口快，所以一直是绿的；板子（aarch64 + 容器）上就翻车。
+    #   加上 `-w 1` 之后，`beginning loop` 才真正等于"订阅端已匹配、马上要发"。
+    pub = Proc(['ros2', 'topic', 'pub', '-w', '1', '--max-wait-time-secs', '25',
+                '--rate', '20', '/cmd_vel',
                 'geometry_msgs/msg/Twist', '{linear: {x: 0.1}}'],
                '/tmp/smoke_pub.log', env=env)
     # ★ 计时必须从"发布器**真的**开始发"起算，不能从"进程启动了"起算。
@@ -244,14 +270,16 @@ def main():
     #   板子上则是在它还没发出第一条之前就被 kill 掉 —— 车当然一动不动，
     #   而现象看起来像"驱动不响应 /cmd_vel"，非常容易查错方向。
     t0 = None
-    deadline = time.monotonic() + 20
+    deadline = time.monotonic() + 35
     while time.monotonic() < deadline:
         time.sleep(0.2)
         if 'beginning loop' in pub.read():
             t0 = time.monotonic()
             break
     res.check('发布器真的开始发 /cmd_vel 了', t0 is not None,
-              '20 s 内没打出 beginning loop' if t0 is None
+              '35 s 内没打出 beginning loop（要么进程起不来，'
+              '要么 25 s 内没匹配到 /cmd_vel 的订阅端）'
+              if t0 is None
               else pub.read().strip().splitlines()[-1][:120])
     # 只发 1.2 s：固件的连续运动上限是 3.0 s，跑久了会锁死底盘。
     # 从这里起算才是真正"车在 RUNNING"的时间。
@@ -261,7 +289,10 @@ def main():
     #   一次 `ros2 topic echo --once` 要花 1~3 秒，如果这段时间里还在发速度，
     #   车就连续 RUNNING 超过 3.0 s → 撞上固件的连续运动上限而锁死，
     #   于是后面的断言全都在测"锁死之后的行为"。**本项目真的踩过这一条**。
-    pub.kill()
+    #   `force=True`：SIGINT 之后 rclpy 走优雅退出，在慢平台上可能又多转一两秒，
+    #   而这一两秒是直接加在"车还在 RUNNING"上的。发布器没有状态要落盘，
+    #   直接 SIGKILL，让"车动了多久"这件事是确定的。
+    pub.kill(force=True)
     # 停发后驱动会在 cmd_vel_timeout 内下发 STOP，所以状态是 ARMED_STOP；
     # 诊断是 1 Hz 快照，读到的就是当下状态。
     # ★ 必须显式放大 `--truncate-length`！`ros2 topic echo` 默认只打 128 个字符
@@ -274,10 +305,22 @@ def main():
     x1 = pos_x(after)
 
     res.check('发出速度后里程计前进', x0 is not None and x1 is not None and x1 > x0 + 0.01,
-              f'x: {x0} → {x1}')
+              f'x: {x0} → {x1}'
+              + ('' if x1 is None or x0 is None or x1 > x0 + 0.01 else
+                 # 车没动时，把"驱动到底有没有收到 /cmd_vel"直接摆出来：
+                 # motion_cmds=0 且没有 cmd_age → 一条都没收到（链路/发现问题）；
+                 # motion_cmds>0 → 收到了并发了 MOVE，那问题在底盘/固件侧。
+                 '  ' + ' '.join(re.findall(
+                     r'(?:motion_cmds|projected|cmd_age)=[^\s]+', diag))))
+    # ★ 不能只查 `cmds > 0`：空闲时驱动自己也在发心跳，`cmds` 永远是正数，
+    #   于是"一条 /cmd_vel 都没收到"也能过 —— 这条断言就白写了。
+    #   真正要证明的是**驱动收到了速度、并且真的发出了 MOVE**。
+    mc = re.search(r'motion_cmds=(\d+)', diag)
     m = re.search(r'cmds=(\d+)', diag)
-    res.check('驱动收到的指令数 > 0', bool(m) and int(m.group(1)) > 0,
-              f'cmds={m.group(1)}' if m else '诊断里没有 cmds 字段')
+    res.check('驱动收到了 /cmd_vel 并发出过 MOVE',
+              bool(mc) and int(mc.group(1)) > 0,
+              f'cmds={m.group(1)} {mc.group(0)}' if m and mc
+              else f'cmds={m.group(1)}' if m else '诊断里没有 cmds/motion_cmds 字段')
     # ★ 两个 CRC 计数要分开看：
     #     crc_errors    = 我们（驱动）收到的坏帧
     #     fw_crc_errors = 固件收到的坏帧
@@ -321,14 +364,14 @@ def main():
 
     print('\n' + '=' * 72)
     if res.failed:
-        print(f'失败 {len(res.failed)} 项：')
+        print(f'失败 {len(res.failed)} / {res.total} 项：')
         for i in res.failed:
             print(f'  - {i}')
         print('\n驱动日志尾部：')
         print('\n'.join(bot.read().splitlines()[-25:]))
         print('=' * 72)
         return 1
-    print('全部通过 ✓')
+    print(f'全部通过 ✓（{res.total} 项）')
     print('=' * 72)
     return 0
 

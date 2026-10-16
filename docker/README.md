@@ -43,10 +43,16 @@ docker/run.sh colcon build --symlink-install
 
 ```bash
 docker/run.sh colcon build --symlink-install
+docker/run.sh python3 -m pytest src/my_robot_description/test -q      # 349 例纯逻辑（板上 344 passed / 5 skipped）
 docker/run.sh ros2 run my_robot_description platform_check.py
 docker/run.sh ros2 run my_robot_description acg720_simulator.py --dry-run
-docker/run.sh python3 src/my_robot_description/test/test_hil_end_to_end.py
+docker/run.sh python3 src/my_robot_description/test/test_hil_end_to_end.py     # 59 项运动模式 HIL
+docker/run.sh python3 src/my_robot_description/test/test_position_nav_hil.py   # 65 项 4A 分段导航 HIL
+docker/run.sh python3 src/my_robot_description/test/test_bringup_smoke.py      # 真 launch，最慢（两分钟起）
 ```
+
+`test_*.py` 里的 HIL/冒烟**不是 pytest 用例**（`conftest.py` 里已 `collect_ignore`），
+要像上面那样单独 `python3` 跑；退出码 0 = 全过，项数由脚本自己打出来。
 
 `platform_check.py` 会自己认出「我在容器里」：`/boot` 不存在、没有
 `/dev/ttyS*` 这类在容器里必然的现象会被降级成提示，不算告警。
@@ -64,6 +70,13 @@ docker/run.sh python3 src/my_robot_description/test/test_hil_end_to_end.py
 * **`--network host` + `--ipc host` 不能省。** host 网络是 DDS 能互相发现的前提；
   host IPC 是 FastDDS 共享内存传输的前提。
 * **故意不装 rviz2。** 板子无头，可视化在别的机器上做。
+* **`ros2 topic pub` 默认不等订阅端匹配。** `--wait-matching-subscriptions`
+  在不带 `--once/--times` 时默认是 **0**（`ros2topic/verb/pub.py` 里的
+  `int(times != 0)`）—— 它打完 `beginning loop` 就立刻发，不管有没有人听。
+  板子上 DDS 端点发现要一两秒，于是"发 1.2 s 速度看车动不动"这种写法会在
+  板子上**静默失败**（开发机上却一直是绿的）。写脚本/排查时要么加 `-w 1`
+  （`--max-wait-time-secs` 兜底），要么别用固定 sleep 卡窗口。
+  本项目的冒烟测试就是这么翻的车，见 `test_bringup_smoke.py` 段 4 的注释。
 
 ---
 
