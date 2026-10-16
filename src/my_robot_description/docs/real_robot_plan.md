@@ -329,10 +329,12 @@ Docker 里的 Jazzy）；CPR 也在 RTL 注释里确认了。
   Rockchip BSP 内核，**不改宿主系统**，用 `docker/` 在容器里跑 Noble + Jazzy。
   板子上已验证（2026-10-16，`ros:jazzy-ros-base` 容器内）：`platform_check.py`
   无阻塞项、`pytest` 344 passed / 5 skipped（5 项厂商交叉核对按设计跳过 ——
-  交接包不在板上）、4A 分段导航 HIL 65/65、运动模式 HIL 59/59。
+  交接包不在板上）、4A 分段导航 HIL 65/65、运动模式 HIL 59/59、
+  **launch 冒烟 32/32（`exit=0`，`motion_cmds=16`，里程计 0.0 → 0.167 m）**。
   冒烟测试第一次在板上跑**暴露了测试自己的一个竞态**（`ros2 topic pub` 默认
-  不等订阅端匹配就开发，慢平台上 1.2 s 窗口会被 DDS 发现吃光），已修，
-  修完的板子复跑结果见 `test_bringup_smoke.py` 自报的项数。
+  不等订阅端匹配就开发，慢平台上 1.2 s 窗口会被 DDS 发现吃光），
+  在 `0a50239` 修掉后板子复跑通过 —— 至此"容器内跑真 `ros2 launch` +
+  虚拟底盘 + 收 `/cmd_vel` 真的动起来"这条链路在目标硬件上闭环了。
 
 ### ⛔ 仍然挡路的
 
