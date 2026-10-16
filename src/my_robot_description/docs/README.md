@@ -1,15 +1,16 @@
 # 文档地图
 
-这个目录里有九份文档。**这份文件是入口**——先看它，再决定读哪份。
+这个目录里有十份文档。**这份文件是入口**——先看它，再决定读哪份。
 
 若干张图（`*.png`）都是各文档正文引用的实测截图/对比图，不单独看。
 
 ---
 
-## 九份文档分别讲什么
+## 十份文档分别讲什么
 
 | 文档 | 讲什么 | 什么时候看 |
 |---|---|---|
+| [`handover_to_teammate.md`](handover_to_teammate.md) | **给硬件侧的任务书**：分工边界、冻结的接口名、会把底盘锁死的红线、按依赖排的步骤、做完要回传什么 | **要把真车（底盘/FPGA/雷达/标定）交给别人做时，直接给他这份** |
 | [`acceptance.md`](acceptance.md) | **三条需求的验收判决**。两个场地、两轮，含明确没通过的 | 想知道"到底做到了没有" |
 | [`nav2.md`](nav2.md) | Nav2 调参细节、定位精度实测、被踩过的坑 | 想改参数、排查导航问题 |
 | [`slam.md`](slam.md) | `slam_toolbox` 建图，两处不改就一定建错的配置 | 要重新建图 |
@@ -51,6 +52,13 @@ real_robot_plan.md（先看第 0 节结论速览 + 第 8 节阻塞项）
   → 第 4 节讲验证手段为什么要换（这条最容易漏）
 ```
 
+**④ 我要把真车交给别人做**（他是硬件侧，不读上面那些）
+
+```
+handover_to_teammate.md       ← 直接给他这一份，他就能开工
+  必要时再补：real_robot_params.md（怎么量）、acg720_protocol.md（要跟 FPGA 对协议时）
+```
+
 ---
 
 ## 权威出处：同一个问题该信哪份
@@ -64,7 +72,8 @@ real_robot_plan.md（先看第 0 节结论速览 + 第 8 节阻塞项）
 | 某个实测数字的上下文 | `acceptance.md` 的表格 | `nav2.md` / `slam.md` 讲细节，不重复表 |
 | 参数当前值 / 实车怎么量 | `real_robot_params.md` | `nav2.md` 只讲"为什么需要这个参数" |
 | 脚本怎么用、怎么判读 | `tools.md` | 别处只提名字 |
-| 实车要做什么 | `real_robot_plan.md` | `nav2.md` 的「已知限制」只讲仿真侧 |
+| 实车要做什么、按什么顺序 | `handover_to_teammate.md`（任务书） | `real_robot_plan.md` 只讲"为什么是这个顺序、依赖什么" |
+| 哪些操作会把底盘锁死 | `handover_to_teammate.md` 第 4 节（速查） | `acg720_protocol.md` 第 0 节给 RTL 依据 |
 | 串口协议 / 驱动节点 / 虚拟车 | `acg720_protocol.md` | 别处只给链接 |
 | FPGA 侧要改什么、为什么 | `fpga_change_request.md` | `acg720_protocol.md` 只讲"固件现在是什么行为" |
 | 分段导航怎么用 / 参数 / 实测 | `position_navigation.md` | `acg720_protocol.md` 只讲位置环的帧格式与 RTL 行为 |
@@ -98,6 +107,11 @@ docs/README.md                   ← 你在这里
     ├── acg720_protocol.md       ★ 真机底盘驱动层（协议/驱动/虚拟车）
     ├── position_navigation.md   ★ 分段导航（不改 FPGA 的连续移动）
     ├── fpga_change_request.md   ★ 给 FPGA 的变更需求（想改成圆弧才需要）
+    │
+    ├── handover_to_teammate.md  ★ 给硬件侧的任务书（分工/红线/步骤/回传）
+    │      ├── acg720_protocol.md  第 0 节给红线的 RTL 依据
+    │      ├── real_robot_params.md 标定与雷达参数逐项怎么量
+    │      └── 用 real_bringup_check.py / scan_check.py 两个脚本判通
     │
     └── real_robot_plan.md       ★ 实车迁移（计划：顺序与依赖）
            ├── acg720_protocol.md      底盘驱动层怎么跑

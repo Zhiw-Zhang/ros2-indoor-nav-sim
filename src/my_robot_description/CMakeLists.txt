@@ -22,6 +22,8 @@ install(PROGRAMS
   scripts/xwd2png.py
   scripts/platform_check.py
   scripts/gen_real_params.py
+  scripts/real_bringup_check.py
+  scripts/scan_check.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

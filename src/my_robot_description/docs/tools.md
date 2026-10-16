@@ -1,6 +1,6 @@
 # 工具脚本
 
-五个脚本装在 `lib/my_robot_description/` 下，都可以用 `ros2 run` 调用。
+七个脚本装在 `lib/my_robot_description/` 下，都可以用 `ros2 run` 调用。
 它们原来是调试时写在临时目录里的，后来收进仓库——**这类工具不该放在
 `/tmp`**（被系统清过一次，丢了一批）。
 
@@ -9,9 +9,45 @@ colcon build --symlink-install --packages-select my_robot_description
 source install/setup.bash
 ```
 
-> ⚠ **这五个脚本里有三个是仿真专用的**（`mapeval.py` 和 `obs_test.py --static`
+> ⚠ **其中三个是仿真专用的**（`mapeval.py` 和 `obs_test.py --static`
 > 都要拿 world SDF 当真值，`xwd2png.py` 截 Gazebo GUI）。搬到真车后它们的替代方案
 > 见 [`real_robot_plan.md` 第 4 节](real_robot_plan.md)。
+>
+> 另外两个（`real_bringup_check.py` / `scan_check.py`）**只在真硬件上有意义**，
+> 用法与判据写在 [`handover_to_teammate.md`](handover_to_teammate.md) 里
+> （第 5 节步骤 1 / 步骤 5）—— 因为它们是交给硬件侧同事执行的第一步，
+> 放在那份任务书里才不会漏。
+
+---
+
+## `real_bringup_check.py` —— 底盘接线体检（只读）
+
+```bash
+ros2 run my_robot_description real_bringup_check.py --port /dev/acg720
+ros2 run my_robot_description real_bringup_check.py --port /dev/acg720 --arm
+```
+
+默认**一个字节都不发**：FPGA 从复位起就 20 Hz 广播遥测，所以只读就能判断
+"串口通不通、位流对不对、底盘有没有锁死、IMU 装没装、位置环闲不闲"。
+`--arm` 才发帧，且固定按 ARM→ACK→DISARM 收尾（**不发运动命令，轮子不会转**）。
+
+判据：结尾「接线这一段通了 ✓」。没有硬件时拿虚拟底盘先看一遍基线：
+`acg720_simulator.py` 打印 `/dev/pts/N`，把它喂给 `--port` 即可。
+
+## `scan_check.py` —— 2D 雷达体检（只读）
+
+```bash
+ros2 run my_robot_description scan_check.py
+ros2 run my_robot_description scan_check.py --selftest   # 不连 ROS/硬件
+```
+
+逐条钉住六类"话题在、有数据、日志无错但就是不能用"的问题：frame_id、
+`base_link → laser_frame` 能不能查到、频率、角度范围与点数、NaN/inf/无回波的
+三种表示法、以及**整块无回波的扇区**（自遮挡会让 costmap 在这些方向留一个
+贴着自己的幽灵障碍）。
+
+判据：结尾「雷达这段通了 ✓」。仿真里 Gazebo 的 `gpu_lidar` 就发 `/scan`，
+所以没有真雷达也能先验这个脚本本身。
 
 ---
 

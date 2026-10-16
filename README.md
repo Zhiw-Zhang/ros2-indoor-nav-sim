@@ -180,6 +180,12 @@ ros2 launch my_robot_description nav.launch.py world:=rooms_obstacles.sdf \
 搬到真车要做的事（验证手段、安全、分阶段推进）整理在
 [`real_robot_plan.md`](src/my_robot_description/docs/real_robot_plan.md)。
 
+> **要把真车（底盘/FPGA/雷达/标定）交给别人做？** 直接把
+> [`handover_to_teammate.md`](src/my_robot_description/docs/handover_to_teammate.md)
+> 给他。那份是**任务书**、不是知识库：分工边界、冻结的接口名、会把底盘**锁死**的
+> 红线、按依赖排序的任务步骤、以及做完要回传什么。它的标准是"读者没看过本项目
+> 的任何聊天记录，照着做不会出事"。
+
 ### 底盘驱动层：已实现，且**没有硬件也能验证**
 
 ACG720 底盘的串口驱动层已经完成（协议、驱动节点、虚拟底盘、真机 bringup）：
@@ -200,6 +206,19 @@ ros2 launch my_robot_description robot.launch.py port:=/dev/pts/N nav:=false
 验证规模：**349 例纯函数单测 + 59 项 HIL 集成测试 + 65 项分段导航 HIL
 + 32 项 launch 冒烟测试**，含 skid-steer 标定闭环（`θ_odom/θ_true` 从 1.36 收到
 1.00）、"非法帧会锁死底盘"、"连续运动 3.0 s 后锁死并如实上报"等真固件行为。
+
+接上真硬件后的两个体检脚本（**都只在硬件侧有意义**，先跑这个再谈别的）：
+
+```bash
+# 底盘接线体检：默认一个字节都不发，只被动读遥测；--arm 才验下行链路（轮子不转）
+ros2 run my_robot_description real_bringup_check.py --port /dev/acg720
+# 雷达体检：frame/TF/频率/点数/NaN/自遮挡扇区
+ros2 run my_robot_description scan_check.py
+```
+
+判据与排查指引写在这两个脚本自己的输出里，不用查文档；
+没有硬件时可以拿虚拟底盘先看一遍"正常长什么样"（`--selftest` 以及
+`real_bringup_check.py --port /dev/pts/N`）。
 
 ### 板子上怎么跑：Ubuntu 22.04 + 容器
 
