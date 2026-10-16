@@ -1,12 +1,12 @@
 # 文档地图
 
-这个目录里有八份文档。**这份文件是入口**——先看它，再决定读哪份。
+这个目录里有九份文档。**这份文件是入口**——先看它，再决定读哪份。
 
 若干张图（`*.png`）都是各文档正文引用的实测截图/对比图，不单独看。
 
 ---
 
-## 八份文档分别讲什么
+## 九份文档分别讲什么
 
 | 文档 | 讲什么 | 什么时候看 |
 |---|---|---|
@@ -18,6 +18,7 @@
 | [`real_robot_plan.md`](real_robot_plan.md) | **实车迁移计划**：还差什么、按什么次序做、安全怎么保证 | 准备上车 |
 | [`real_robot_params.md`](real_robot_params.md) | **实车参数标定操作手册**：逐项怎么量、填哪 | 上车后动手标定 |
 | [`fpga_change_request.md`](fpga_change_request.md) | **给电机/FPGA 负责人的变更需求**：现象、RTL 证据、最小改法、怎么验、不建议的做法 | 要往连续导航推进时；或想确认"到底卡在哪一环" |
+| [`position_navigation.md`](position_navigation.md) | **分段导航**：不改 FPGA、用 `0x05 POSITION` 走折线实现连续移动。用法、参数、实测、排查 | 想现在就连续导航（不等 FPGA 改动）；或用 `control_mode:=position` 出了状况 |
 
 ---
 
@@ -43,7 +44,8 @@ acceptance.md（先看开头的结论表）
 ```
 real_robot_plan.md（先看第 0 节结论速览 + 第 8 节阻塞项）
   → acg720_protocol.md（底盘驱动层：协议、怎么跑、没硬件怎么验）
-  → fpga_change_request.md（连续导航为什么还做不了）
+  → position_navigation.md（**不改 FPGA 就能连续导航的那条路**）
+  → fpga_change_request.md（想改成连续圆弧运动，FPGA 要动哪里）
   → 第 3 节讲标定顺序
   → real_robot_params.md 逐项照做
   → 第 4 节讲验证手段为什么要换（这条最容易漏）
@@ -65,6 +67,7 @@ real_robot_plan.md（先看第 0 节结论速览 + 第 8 节阻塞项）
 | 实车要做什么 | `real_robot_plan.md` | `nav2.md` 的「已知限制」只讲仿真侧 |
 | 串口协议 / 驱动节点 / 虚拟车 | `acg720_protocol.md` | 别处只给链接 |
 | FPGA 侧要改什么、为什么 | `fpga_change_request.md` | `acg720_protocol.md` 只讲"固件现在是什么行为" |
+| 分段导航怎么用 / 参数 / 实测 | `position_navigation.md` | `acg720_protocol.md` 只讲位置环的帧格式与 RTL 行为 |
 | 上游默认值为什么不能照抄 | `nav2.md` 的「配置里几处必须跟着实车改的地方」 | —— |
 
 **已合并的两处**（留个记录，避免以后又写重）：
@@ -93,11 +96,13 @@ docs/README.md                   ← 你在这里
     ├── tools.md                 验证工具
     │
     ├── acg720_protocol.md       ★ 真机底盘驱动层（协议/驱动/虚拟车）
-    ├── fpga_change_request.md   ★ 给 FPGA 的变更需求（卡点在这里）
+    ├── position_navigation.md   ★ 分段导航（不改 FPGA 的连续移动）
+    ├── fpga_change_request.md   ★ 给 FPGA 的变更需求（想改成圆弧才需要）
     │
     └── real_robot_plan.md       ★ 实车迁移（计划：顺序与依赖）
            ├── acg720_protocol.md      底盘驱动层怎么跑
-           ├── fpga_change_request.md  连续导航为什么做不了、要改哪
+           ├── position_navigation.md  不改固件的连续导航怎么用
+           ├── fpga_change_request.md  想改成圆弧/连续运动、要改哪
            └── real_robot_params.md    实车标定（手册：逐项操作）
 ```
 

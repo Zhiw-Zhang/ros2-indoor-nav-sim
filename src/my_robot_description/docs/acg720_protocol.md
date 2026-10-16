@@ -364,6 +364,11 @@ v    = base·mps·(1+ρ)/2
 
 ## 7. `0x05 POSITION`：今天唯一能真正驱动真车的运动原语
 
+> **用它做连续导航的路子已经实现**：把目标点拆成一串位置段
+> （`control_mode:=position`）。用法、参数、实测数字、排查表在
+> [`position_navigation.md`](position_navigation.md)；本节只讲这个命令
+> **在固件里是什么行为**，不重复那边的操作细节。
+
 ### 7.1 闭环参数（`chassis_position_controller.v:9-17`）
 
 | 参数 | 值 | 含义 |

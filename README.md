@@ -167,7 +167,8 @@ ros2 launch my_robot_description nav.launch.py world:=rooms_obstacles.sdf \
 | [real_robot_plan.md](src/my_robot_description/docs/real_robot_plan.md) | **实车迁移计划** |
 | [real_robot_params.md](src/my_robot_description/docs/real_robot_params.md) | **实车参数标定手册** |
 | [acg720_protocol.md](src/my_robot_description/docs/acg720_protocol.md) | **真机底盘驱动层**：真串口协议（逐行标注 RTL 出处）、驱动节点、虚拟底盘 |
-| [fpga_change_request.md](src/my_robot_description/docs/fpga_change_request.md) | **给 FPGA 的变更需求**：连续导航为什么做不了、改哪一处、怎么验 |
+| [position_navigation.md](src/my_robot_description/docs/position_navigation.md) | **分段导航**：不改 FPGA、用 `0x05 POSITION` 走折线实现连续移动（用法/参数/实测/排查） |
+| [fpga_change_request.md](src/my_robot_description/docs/fpga_change_request.md) | **给 FPGA 的变更需求**：想改成连续圆弧运动要改哪一处、怎么验 |
 | [docker/README.md](docker/README.md) | **在 RK3588 板子上用容器跑**（宿主 22.04 → 容器里的 Jazzy） |
 
 ---
@@ -196,9 +197,9 @@ ros2 launch my_robot_description robot.launch.py port:=/dev/pts/N nav:=false
 每条结论都标了 `文件:行号`，并与厂商的 `chassis_control.py` 做了逐字节交叉核对。
 细节见 [`acg720_protocol.md`](src/my_robot_description/docs/acg720_protocol.md)。
 
-验证规模：**231 例纯函数单测 + 59 项 HIL 集成测试 + 33 项 launch 冒烟测试**，
-含 skid-steer 标定闭环（`θ_odom/θ_true` 从 1.36 收到 1.00）、
-"非法帧会锁死底盘"、"连续运动 3.0 s 后锁死并如实上报"等真固件行为。
+验证规模：**349 例纯函数单测 + 59 项 HIL 集成测试 + 65 项分段导航 HIL
++ 33 项 launch 冒烟测试**，含 skid-steer 标定闭环（`θ_odom/θ_true` 从 1.36 收到
+1.00）、"非法帧会锁死底盘"、"连续运动 3.0 s 后锁死并如实上报"等真固件行为。
 
 ### 板子上怎么跑：Ubuntu 22.04 + 容器
 
@@ -226,14 +227,20 @@ docker/run.sh ros2 run my_robot_description platform_check.py
 
 ### 接真车前必须解决的两条
 
-* ⚠️ **连续导航被固件的 3.0 s 运行上限挡住。** 这不是"还没做"，是"做不了"：
+* ⚠️ **连续的 `0x02 MOVE` 会被固件的 3.0 s 运行上限挡住。**
   `0x02 MOVE` 连续跑满 3.0 秒就会锁存 `FAULT_RUN_LIMIT` 并切断电机使能，
-  只能断电或"松开 S0 再按 S4"复位；而且**重发命令不能续期**。
-  实测确认：即使是 10 Hz 连续重发也一样触顶。
-  今天唯一能真正驱动真车的运动原语是 `0x05 POSITION`（分段走）。
-  需要 FPGA 侧改什么、为什么、怎么验，都写在
-  [`fpga_change_request.md`](src/my_robot_description/docs/fpga_change_request.md) 里 ——
-  **结论是只需要改一处**（运行上限策略），不需要新增协议命令。
+  只能断电或"松开 S0 再按 S4"复位；而且**重发命令不能续期**（实测：10 Hz 连续
+  重发一样触顶）。
+  **但现在有两条路，不必等 FPGA：**
+  * **`control_mode:=position`** —— 把目标点拆成一串 `0x05 POSITION` 段。位置环
+    不受这条上限约束（`chassis_safety_fsm.v:57-58` 的 `!position_active`），
+    实测**单段连续跑 8.26 s 而 `fault=NONE`**、2.5 m 目标走到 2.498 m。
+    代价是**没有圆弧**（位置环只有前进/后退/原地左右旋四个动作），轨迹只能是
+    "转—直行—转"折线，平均速度约 0.09 m/s。用法见
+    [`position_navigation.md`](src/my_robot_description/docs/position_navigation.md)。
+  * **改 FPGA** —— 想要连续圆弧运动就得动固件。改什么、为什么、怎么验写在
+    [`fpga_change_request.md`](src/my_robot_description/docs/fpga_change_request.md)
+    里，**结论是只需要改一处**（运行上限策略），不需要新增协议命令。
 * ⚠️ **两套 URDF 的物理参数都未经实车复核。** 仿真用的
   [`my_robot.urdf.xacro`](src/my_robot_description/urdf/my_robot.urdf.xacro) 是按
   0.4×0.3 底盘估的占位值（含 `wheel_separation_scale = 1.36`、

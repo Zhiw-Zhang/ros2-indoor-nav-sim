@@ -48,6 +48,7 @@ install(FILES
   src/acg720_protocol_v1.py
   src/acg720_firmware.py
   src/drive_kinematics.py
+  src/position_segments.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -6,11 +6,12 @@
 
 | 文件 | 类型 | 运行方式 |
 |---|---|---|
-| `test_protocol_and_kinematics.py` | 纯函数 **pytest** 测试 | `pytest test/` |
+| `test_protocol_v1.py` 等 | 纯函数 **pytest** 测试 | `pytest test/` |
 | `test_hil_end_to_end.py` | **脚本式** HIL 测试（需要 PTY 和真节点） | `python3 test_hil_end_to_end.py` |
+| `test_position_nav_hil.py` | **脚本式** HIL 测试（分段导航，需要 PTY） | `python3 test_position_nav_hil.py` |
 | `test_bringup_smoke.py` | **脚本式** launch 冒烟测试 | `python3 test_bringup_smoke.py` |
 
-后两个的函数签名是 `fn(failures, harness)` / `fn(failures)`，**不是 pytest fixture**。
+后三个的函数签名是 `fn(failures, harness)` / `fn(failures)`，**不是 pytest fixture**。
 pytest 会自动发现 `test_*.py` 里的 `test_*` 函数，于是把
 `test_heartbeat_timeout_safe_state(f)` 里的 `f` 当成 fixture 名，报一堆
 `fixture 'f' not found`。
@@ -26,8 +27,9 @@ pytest 会自动发现 `test_*.py` 里的 `test_*` 函数，于是把
 所以什么都没损失。
 """
 
-#: 这两个文件由脚本方式运行，不是 pytest 用例（见模块 docstring）
+#: 这些文件由脚本方式运行，不是 pytest 用例（见模块 docstring）
 collect_ignore = [
     "test_hil_end_to_end.py",
+    "test_position_nav_hil.py",
     "test_bringup_smoke.py",
 ]

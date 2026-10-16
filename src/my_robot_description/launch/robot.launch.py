@@ -76,6 +76,12 @@ def _launch_setup(context, *args, **kwargs):
     max_base_rpm = cfg.get('max_base_rpm', '200.0')
     cmd_vel_timeout = cfg.get('cmd_vel_timeout', '0.5')
     control_mode = cfg.get('control_mode', 'move')
+    goal_topic = cfg.get('goal_topic', 'acg720/goal')
+    goal_uses_yaw = str(cfg.get('goal_uses_yaw', 'false')).lower() in ('true', '1')
+    cmd_vel_overrides_goal = str(
+        cfg.get('cmd_vel_overrides_goal', 'true')).lower() in ('true', '1')
+    segment_straight_rpm = cfg.get('segment_straight_rpm', '30')
+    segment_turn_rpm = cfg.get('segment_turn_rpm', '20')
     expected_build_id = cfg.get('expected_build_id', '20260A02')
     allow_run_limit = str(cfg.get('allow_run_limit', 'false')).lower() in ('true', '1')
     map_yaml = cfg.get('map', '')
@@ -98,11 +104,21 @@ def _launch_setup(context, *args, **kwargs):
 
     actions = []
 
-    actions.append(LogInfo(msg=(
-        '★ 固件限制：连续运动（0x02 MOVE）最多 3.0 s 就会锁存 FAULT_RUN_LIMIT，'
-        '之后只能断电或「松开 S0 再按 S4」复位。任何一次串口中断超过 300 ms '
-        '（命令超时）也会同样锁死。连续导航需要 FPGA 变更，'
-        '详见 docs/fpga_change_request.md。')))
+    if control_mode == 'position':
+        actions.append(LogInfo(msg=(
+            '★ control_mode:=position —— 用 0x05 POSITION 位置段走折线，'
+            '**不受 3.0 s 连续运动上限约束**（chassis_safety_fsm.v:57-58 的 '
+            '!position_active）。但它**没有圆弧**：位置环只有前进/后退/'
+            '原地左右旋四个动作，所以轨迹是"转—直行—转"。'
+            '任何一次串口中断超过 300 ms 仍会锁死。'
+            '详见 docs/position_navigation.md。')))
+    else:
+        actions.append(LogInfo(msg=(
+            '★ 固件限制：连续运动（0x02 MOVE）最多 3.0 s 就会锁存 FAULT_RUN_LIMIT，'
+            '之后只能断电或「松开 S0 再按 S4」复位。任何一次串口中断超过 300 ms '
+            '（命令超时）也会同样锁死。连续运动需要 FPGA 变更，详见 '
+            'docs/fpga_change_request.md；不想改 FPGA 就用 '
+            'control_mode:=position（折线，见 docs/position_navigation.md）。')))
 
     # ---- 1. 底盘驱动 ----
     actions.append(Node(
@@ -126,6 +142,13 @@ def _launch_setup(context, *args, **kwargs):
             'max_base_rpm': float(max_base_rpm),
             'cmd_vel_timeout': float(cmd_vel_timeout),
             'control_mode': control_mode,
+            # ---- control_mode:=position 时生效（0x05 位置段分段导航）----
+            # 见 docs/position_navigation.md。它不受 3.0 s 上限约束。
+            'goal_topic': goal_topic,
+            'goal_uses_yaw': goal_uses_yaw,
+            'cmd_vel_overrides_goal': cmd_vel_overrides_goal,
+            'segment_straight_rpm': int(segment_straight_rpm),
+            'segment_turn_rpm': int(segment_turn_rpm),
             # ★ 位流版本号：不符就拒绝一切运动命令（烧错位流时 fail-safe）
             'expected_build_id': expected_build_id,
             # ★ 连续运动 3.0 s 后固件会锁死；真实串口上必须显式确认
@@ -263,8 +286,29 @@ def generate_launch_description():
             description='/cmd_vel 超时停车时间 s'),
         DeclareLaunchArgument(
             'control_mode', default_value='move',
-            description="控制模式。目前只实现 'move'（主机侧把 (v, ω) 反解成 "
-                        "0x02 MOVE）；基于 0x05 POSITION 的分段导航是独立的一期工作"),
+            description="控制模式。'move' = 主机把 (v, ω) 反解成 0x02 MOVE"
+                        "（连续、但**受 3.0 s 上限**）；'position' = 主机把目标点拆成"
+                        "一串 0x05 POSITION（折线、**不受 3.0 s 上限**，"
+                        "见 docs/position_navigation.md）"),
+        DeclareLaunchArgument(
+            'goal_topic', default_value='acg720/goal',
+            description='position 模式的目标点话题（geometry_msgs/PoseStamped）。'
+                        '可以 remap 成 /goal_pose，用 RViz 的 2D Goal Pose 直接派'),
+        DeclareLaunchArgument(
+            'goal_uses_yaw', default_value='false',
+            description='position 模式是否把目标的朝向当成约束。默认 false —— '
+                        '注意 ROS 里 PoseStamped 的默认四元数是 (0,0,0,1)，'
+                        '那代表**朝向 +x**，不是"未指定"'),
+        DeclareLaunchArgument(
+            'cmd_vel_overrides_goal', default_value='true',
+            description='position 模式下非零 /cmd_vel 视为人工接管，中止当前目标。'
+                        '摇杆压过自主导航，台架调试时的保命开关'),
+        DeclareLaunchArgument(
+            'segment_straight_rpm', default_value='30',
+            description='position 模式的直线段转速（固件只接受 8–40）'),
+        DeclareLaunchArgument(
+            'segment_turn_rpm', default_value='20',
+            description='position 模式的原地转转速（固件只接受 8–40）'),
         DeclareLaunchArgument(
             'expected_build_id', default_value='20260A02',
             description='★ 期望的位流版本号（0x83 遥测里的 build_id）。不符就拒绝'

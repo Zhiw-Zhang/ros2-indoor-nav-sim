@@ -48,6 +48,25 @@
 
 7. **失败要吵。** 串口打不开、CRC 一直错、底盘锁死、位流不对——都必须报
    ERROR/WARN，否则症状是"launch 起来了、话题也在、车就是不动"。
+
+8. **`control_mode="position"`：用 0x05 位置段做连续导航，绕开 3.0 s 上限。**
+   位置环**不受** `RUN_LIMIT` 约束（`chassis_safety_fsm.v:57-58` 里的
+   `!position_active`），所以"一串位置段"可以在**不改 FPGA** 的前提下连续走。
+   代价是**没有圆弧** —— 位置环只有前进/后退/原地左旋/原地右旋四种动作
+   （`chassis_position_controller.v:44-47`），轨迹只能是折线。
+
+   分段策略本身在 `position_segments.py`（纯逻辑、有单测，不依赖 ROS），
+   本节点只负责接线：收目标 → 发 POSITION → 用 0x84 判段结束 → 发下一段。
+
+   position 模式下有三条硬规矩，违反任何一条都会出真问题：
+
+   * 段进行中**只发 HEARTBEAT**，绝不发 MOVE/ARM/DISARM/OPEN_LOOP ——
+     `top.v:121-125` 把这四种 kind 当成 `position_abort`，会把当前段**中断**。
+   * 段结束那一拍 `busy` 落回 0 之后，`target_rpm` 立刻切回**手动目标**
+     （`top.v:152` 的三目运算符）。所以 position 模式**绝不能同时下 MOVE**，
+     否则段一结束，车会带着残留目标继续冲出去。
+   * 段下发前**自己再校验一遍参数**：非法的 POSITION 会被判
+     `protocol_fault` → **永久锁死底盘**，不是"报个错"。见 `_maybe_send_position`。
 """
 
 from __future__ import annotations
@@ -61,13 +80,14 @@ import time
 from typing import List, Optional, Tuple
 
 import rclpy
-from geometry_msgs.msg import Quaternion, TransformStamped, Twist
+from geometry_msgs.msg import PoseStamped, Quaternion, TransformStamped, Twist
 from nav_msgs.msg import Odometry
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
                        QoSReliabilityPolicy)
 from std_msgs.msg import String
-from tf2_ros import TransformBroadcaster
+from tf2_ros import Buffer, TransformBroadcaster, TransformListener
 
 import serial
 from serial import SerialException
@@ -76,13 +96,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from acg720_firmware import fault_cn  # noqa: E402
 from acg720_protocol_v1 import (  # noqa: E402
-    FaultReason, FrameParser, Kind, SafetyState, SequenceTracker,
-    delta32, encode_command, pack_move, parse_ack, parse_diagnostic,
-    parse_position_telemetry, parse_telemetry,
+    FaultReason, FrameParser, Kind, ProtocolError, SafetyState, SequenceTracker,
+    delta32, encode_command, pack_move, pack_position, parse_ack,
+    parse_diagnostic, parse_position_telemetry, parse_telemetry,
 )
 from drive_kinematics import (  # noqa: E402
     MoveCommand, Pose2D, SkidSteerGeometry, quaternion_from_yaw, twist_to_move,
-    wrap_angle,
+    wrap_angle, yaw_from_quaternion,
+)
+from position_segments import (  # noqa: E402
+    ActionKind, ExecState, Segment, SegmentExecutor, SegmentParams,
+    SegmentPlanner, TargetPoint,
 )
 
 #: 底盘安全状态的中文名（与 acg720_firmware 的故障表配套）
@@ -131,6 +155,8 @@ class Acg720Driver(Node):
         self.declare_parameter("tracking_floor_rpm", 7.0)
 
         # 协议 / 安全
+        #: "move"     = 主机把 (v, ω) 反解成 0x02 MOVE（连续运动，**受 3 s 上限**）
+        #: "position" = 主机把目标点拆成 0x05 POSITION 段（折线，**不受 3 s 上限**）
         self.declare_parameter("control_mode", "move")
         #: 位流版本号（chassis_telemetry_imu_tx.v:40）。空串 = 不校验
         self.declare_parameter("expected_build_id", "20260A02")
@@ -141,6 +167,24 @@ class Acg720Driver(Node):
         self.declare_parameter("min_command_interval", 0.05)
         #: 在真实串口上使用连续运动前必须显式确认：3.0 s 后会锁死（固件限制）
         self.declare_parameter("allow_run_limit", False)
+
+        # ---- position 模式专用 ----
+        #: 目标点话题（geometry_msgs/PoseStamped）。可以 remap 成 /goal_pose，
+        #: 这样 RViz 的 "2D Goal Pose" 工具就能直接派目标。
+        self.declare_parameter("goal_topic", "acg720/goal")
+        #: 目标里是否使用朝向。默认 False —— RViz/多数工具发的是"到点即可"，
+        #: 朝向字段往往是垃圾值，当成约束会把车逼着原地乱转。
+        self.declare_parameter("goal_uses_yaw", False)
+        #: 非零 /cmd_vel 视为"人工接管"，立刻中止当前目标。默认开：
+        #: 摇杆永远该能压过自主导航，这是台架调试时的保命开关。
+        self.declare_parameter("cmd_vel_overrides_goal", True)
+        #: 分段策略参数，透传给 position_segments.SegmentParams
+        self.declare_parameter("segment_heading_tolerance_rad", 0.10)
+        self.declare_parameter("segment_position_tolerance_m", 0.03)
+        self.declare_parameter("segment_straight_rpm", 30)
+        self.declare_parameter("segment_turn_rpm", 20)
+        self.declare_parameter("segment_max_bad_streak", 3)
+        self.declare_parameter("segment_max_without_progress", 6)
 
         # 时序
         self.declare_parameter("cmd_vel_timeout", 0.5)        # s，超时停车
@@ -158,12 +202,11 @@ class Acg720Driver(Node):
         self.baudrate = self.get_parameter("baudrate").value
         self.dry_run = self.get_parameter("dry_run").value
         self.control_mode = self.get_parameter("control_mode").value
-        if self.control_mode != "move":
+        if self.control_mode not in ("move", "position"):
             raise ValueError(
-                f"control_mode={self.control_mode!r} 目前不支持。"
-                f"本期只实现了 'move'（主机侧把 (v, ω) 反解成 0x02 MOVE）。"
-                f"基于 0x05 POSITION 的'分段导航'是独立的一期工作，"
-                f"不要用本节点半成品地跑它。")
+                f"control_mode={self.control_mode!r} 不支持。只有两种："
+                f"'move'（(v, ω) → 0x02 MOVE，连续但**受 3 s 上限**）和 "
+                f"'position'（目标点 → 一串 0x05 POSITION，折线但不受上限）。")
 
         self.geom = SkidSteerGeometry(
             wheel_radius_m=self.get_parameter("wheel_radius_m").value,
@@ -198,6 +241,53 @@ class Acg720Driver(Node):
         self.position_busy = False
         self.position_done = False
         self.position_result: Optional[int] = None
+        self.position_progress = 0
+        #: 上一次看到的 0x84 `done` **电平**，用来做上升沿检测。
+        #: `done` 在固件里是电平（段完成置 1、下一段 start 才清 0），
+        #: 而 0x84 是 20 Hz 周期广播 —— 不去重就会把上一段的完成帧
+        #: 当成新段的结果。详见 `_handle_frame`。
+        self._position_done_level = False
+
+        # ---- position 模式：目标点 → 位置段 ----
+        # 分段策略是纯逻辑（position_segments.py），这里只接线。
+        self.segment_params: Optional[SegmentParams] = None
+        self.segment_planner: Optional[SegmentPlanner] = None
+        self.segment_executor: Optional[SegmentExecutor] = None
+        self.segment_ack_count = 0
+        #: 已下发但还没被 0x84 确认结束的那一段（只用于日志）
+        self._inflight_segment: Optional[Segment] = None
+        #: 0x84 报来的 (result_code, progress)，等下一拍在发送路径上消费。
+        #: ★ 不在这里直接触发"发下一段"：所有串口写都必须走同一个地方，
+        #:   否则限速/SEQ 的记账会有两个说法。
+        self._pending_segment_result: Optional[Tuple[int, int]] = None
+        self._need_stop = False
+        self._goal_seq = 0
+
+        # ★ 位置模式的规划器/执行器必须在这里构造 —— **在状态初始化之后**。
+        #   曾经把它放在上面的几何参数旁边，结果被这里的 `= None` 初始化覆盖掉，
+        #   症状是 `_on_goal` 直接 return（目标像石沉大海）、`_position_tick`
+        #   断言炸掉。构造依赖 `self.geom` 和参数，所以位置也只能在这之后。
+        if self.control_mode == "position":
+            # 分段参数一次性读出来。刻意不支持运行中改：改到一半会让"上一段用旧
+            # rpm、下一段用新 rpm"，而段长上限是按 rpm 反算的，混着用可能撞上
+            # 固件的段内超时（11.95 s）。
+            self.segment_params = SegmentParams(
+                heading_tolerance_rad=self.get_parameter(
+                    "segment_heading_tolerance_rad").value,
+                position_tolerance_m=self.get_parameter(
+                    "segment_position_tolerance_m").value,
+                straight_rpm=int(self.get_parameter("segment_straight_rpm").value),
+                turn_rpm=int(self.get_parameter("segment_turn_rpm").value),
+                max_bad_streak=int(self.get_parameter(
+                    "segment_max_bad_streak").value),
+                max_segments_without_progress=int(self.get_parameter(
+                    "segment_max_without_progress").value),
+            )
+            # 构造失败（容差配得根本没法指令等）就在这里抛出来 —— 这是好事：
+            # 宁可起不来，也不要"起来了但每一段都发不出去"。
+            self.segment_planner = SegmentPlanner(self.geom, self.segment_params)
+            self.segment_executor = SegmentExecutor(self.segment_planner,
+                                                    self.segment_params)
 
         self._prev_counts: Optional[List[int]] = None
         self.last_telemetry_time: Optional[float] = None
@@ -240,6 +330,28 @@ class Acg720Driver(Node):
                        reliability=QoSReliabilityPolicy.RELIABLE,
                        durability=QoSDurabilityPolicy.TRANSIENT_LOCAL))
 
+        if self.control_mode == "position":
+            # 目标点。用 PoseStamped 是为了能 remap 到 /goal_pose ——
+            # 那样 RViz 的 "2D Goal Pose" 工具就直接能派目标。
+            # ⚠ QoS 必须用**默认的**（RELIABLE + VOLATILE）。这里曾经写成
+            #   TRANSIENT_LOCAL 想"后连上来的也能拿到目标"，那是错的：
+            #   DDS 的 durability 匹配要求 offered ≥ requested，而 RViz 和
+            #   `ros2 topic pub` 发的都是 VOLATILE —— 于是**根本连不上**，
+            #   症状是"话题在、发了没反应、连个警告都没有"。
+            #   latched 语义只对**状态上报**有意义（见下面的 segment_pub）。
+            self.create_subscription(
+                PoseStamped, self.get_parameter("goal_topic").value,
+                self._on_goal, 1)
+            # 目标可能来自 map 系（RViz / Nav2），所以需要一个 TF 监听来做变换。
+            self.tf_buffer = Buffer()
+            self.tf_listener = TransformListener(self.tf_buffer, self)
+            # 段状态上报。latched = 后连上来的订阅者立刻知道当前到哪了。
+            self.segment_pub = self.create_publisher(
+                String, "acg720/segment_status", QoSProfile(
+                    depth=1, history=QoSHistoryPolicy.KEEP_LAST,
+                    reliability=QoSReliabilityPolicy.RELIABLE,
+                    durability=QoSDurabilityPolicy.TRANSIENT_LOCAL))
+
         self.create_timer(0.01, self._on_control_tick)      # 100 Hz 决策
         self.create_timer(self.get_parameter("status_period").value, self._on_status_timer)
 
@@ -272,6 +384,12 @@ class Acg720Driver(Node):
         "control_mode": str, "expected_build_id": str, "auto_arm": bool,
         "command_period": float, "min_command_interval": float,
         "allow_run_limit": bool,
+        "goal_topic": str, "goal_uses_yaw": bool,
+        "cmd_vel_overrides_goal": bool,
+        "segment_heading_tolerance_rad": float,
+        "segment_position_tolerance_m": float,
+        "segment_straight_rpm": int, "segment_turn_rpm": int,
+        "segment_max_bad_streak": int, "segment_max_without_progress": int,
         "cmd_vel_timeout": float, "status_period": float,
         "odom_frame": str, "base_frame": str, "publish_tf": bool,
         "reconnect_period": float, "dry_run": bool,
@@ -291,10 +409,16 @@ class Acg720Driver(Node):
         return params
 
     def _check_run_limit_policy(self) -> None:
-        """在真实串口上用连续运动之前，要求显式确认过 3 s 上限。
+        """在真实串口上用**连续运动**之前，要求显式确认过 3 s 上限。
 
         PTY（虚拟底盘）不算真实端口 —— 测试要能直接跑。
+
+        ⚠ position 模式**不受这条限制**，也不走这个检查：它一条 MOVE 都不发，
+          3 s 上限在固件里对位置环是关掉的（`chassis_safety_fsm.v:57-58` 的
+          `!position_active`）。在这里拦住它等于把唯一的绕行方案也堵死。
         """
+        if self.control_mode != "move":
+            return
         if self.dry_run or "pts" in str(self.port):
             return
         if self.get_parameter("allow_run_limit").value:
@@ -302,7 +426,9 @@ class Acg720Driver(Node):
         raise RuntimeError(
             f"port={self.port} 看起来是真实串口，而连续运动会在 3.0 s 后把底盘"
             f"锁死在 FAULT_RUN_LIMIT（固件限制，只能断电/复位解除）。"
-            f"确认你是在台架上做验证后，再加参数 allow_run_limit:=true。")
+            f"确认你是在台架上做验证后，再加参数 allow_run_limit:=true。"
+            f"（若想避开这条限制，用 control_mode:=position —— 它靠位置段走折线，"
+            f"不触发 3 s 上限。）")
 
     # ==================================================================
     # 串口
@@ -480,6 +606,13 @@ class Acg720Driver(Node):
         if self.build_id_ok is False:
             return
 
+        # ---- 0) 有人要求停车（人工接管 / 目标被中止）----
+        # 走的仍然是正常的限速路径，**不会**插到在途的 ACK 前面去。
+        if self._need_stop:
+            if self._send(Kind.STOP, b"", "stop"):
+                self._need_stop = False
+            return
+
         period = self.get_parameter("command_period").value
 
         # 还没 ARM：先 ARM（只发一次）。ARM 之前只发心跳，让固件知道主机活着
@@ -497,6 +630,14 @@ class Acg720Driver(Node):
             if self._send(Kind.ARM, b"", "arm"):
                 self.arm_sent = True
                 self.get_logger().info("已发送 ARM（使能底盘）")
+            return
+
+        # ---- position 模式：完全不看 /cmd_vel，只走位置段 ----
+        # ★ 必须**在这里分叉**而不是在下面加个 if：move 模式的分支会发 MOVE，
+        #   而 position 模式下一旦发出 MOVE，段一结束车就会带着残留手动目标
+        #   继续冲（top.v:152）。两条路径必须互斥。
+        if self.control_mode == "position":
+            self._position_tick(now)
             return
 
         v, w = self._desired_twist()
@@ -530,6 +671,201 @@ class Acg720Driver(Node):
         self.cmd_count += 1
         self.motion_cmd_count += 1
         self.last_move = mc
+
+    # ==================================================================
+    # position 模式：目标点 → 位置段
+    # ==================================================================
+
+    def _position_tick(self, now: float) -> None:
+        """position 模式下每次该发命令时走这里。
+
+        两条铁律（见模块 docstring 第 8 条）：
+          * 段进行中只发 HEARTBEAT —— MOVE/ARM/DISARM/OPEN_LOOP 会 abort 当前段；
+          * 绝不在这里发 MOVE —— 段结束时残留的手动目标会立刻接管。
+        """
+        ex = self.segment_executor
+        assert ex is not None
+
+        # 1) 先消费 0x84 报来的段结果（由 _handle_frame 存下，不在这里直接发）
+        if self._pending_segment_result is not None:
+            code, progress = self._pending_segment_result
+            self._pending_segment_result = None
+            self._inflight_segment = None
+            action = ex.on_result(self.pose, code, progress, now)
+            self._report_action(action, "段结果")
+            # 本拍只做这一件事：要么已经把下一段发出去了，要么报了终态。
+            # 不再往下走 —— 否则同一拍里还要再判一次"要不要发心跳"，纯属绕圈。
+            return
+
+        # 2) 没目标 / 在等段完成 → 只喂狗
+        if not ex.active:
+            self._send_heartbeat()
+            return
+
+        # 3) 限速没到就**本拍什么都不做**。
+        #    不能"先规划再发"，因为规划会把执行器推到 WAITING，而发不出去时
+        #    要回滚 —— 回滚本身是对的（见 on_send_deferred），但那样每 10 ms
+        #    就白规划一次，日志和计数全是噪声。直接不进场最干净。
+        if not self._tx_due():
+            return
+
+        action = ex.poll(self.pose, now)
+        if action.kind is ActionKind.IDLE:
+            # 正在等当前段走完。心跳既维持 300 ms 狗，又不会 abort 位置段
+            # （top.v:121-125 里 position_abort 只认 0/2/3/4 四种 kind）。
+            self._send_heartbeat()
+            return
+        self._report_action(action, "规划")
+        if action.kind is ActionKind.SEND:
+            return
+        # ARRIVED / FAILED 已在 _report_action 里发布过状态
+
+    def _maybe_send_position(self, seg: Segment) -> str:
+        """下发一段 POSITION。返回 'sent' / 'deferred' / 'error'。
+
+        ★ 这里有一道独立的参数校验，不是多余的：越界的 POSITION 会被固件判
+          `protocol_fault`，而 `top.v:231` 把它 OR 进了安全状态机的锁存 ——
+          后果是**永久锁死底盘**，不是"报个错重来"。规划器侧已有穷举单测
+          （test_position_segments.py）保证不产出非法段，这里是第二道闸。
+        """
+        try:
+            payload = pack_position(**seg.position_kwargs())
+        except (ProtocolError, TypeError, ValueError) as exc:
+            self.get_logger().error(
+                f"★ 算出了一个非法的位置段，已拒绝下发（它会让固件 protocol_fault "
+                f"并永久锁死底盘）：{seg.describe()} —— {exc}")
+            self._latch(f"segment REJECTED_LOCALLY {seg.describe()} ({exc})")
+            return "error"
+        if not self._send(Kind.POSITION, payload, "position"):
+            # `_send` 返回 False 有两种原因，必须分开：
+            #   · 被 `min_command_interval` 挡掉 → **正常**，下拍再来；
+            #   · 真的写失败了（串口没了）→ 要记账。
+            # 区分办法：`_send` 只有在**通过**限速检查之后才可能写失败，
+            # 而写失败不会更新 `_last_tx_time`。所以"限速仍然没到"= 前者。
+            if self._tx_due():
+                self.get_logger().error(f"位置段写入串口失败：{seg.describe()}")
+                return "error"
+            return "deferred"
+        self._inflight_segment = seg
+        ex = self.segment_executor
+        if ex is not None:
+            ex.note_sent()
+        self.segment_ack_count += 1
+        self.get_logger().info(
+            f"位置段已下发：{seg.describe()}"
+            + (f"（{seg.note}）" if seg.note else ""))
+        return "sent"
+
+    def _report_action(self, action, where: str) -> None:
+        """把执行器的决策反映到日志/状态话题上，并在 SEND 时真正下发。"""
+        ex = self.segment_executor
+        assert ex is not None
+        if action.kind is ActionKind.SEND:
+            outcome = self._maybe_send_position(action.segment)
+            if outcome == "error":
+                # 参数非法 / 串口没了：要吵，而且要记账
+                ex.on_send_failed("段参数非法或串口写失败")
+            elif outcome == "deferred":
+                # ★ 限速挡掉是**正常**的（每 5 拍就会发生一次）：退回去，
+                #   下一拍再发，**不计失败**。这里曾经把它算进 bad_streak，
+                #   三次就放弃 —— 症状是"目标刚下发就报失败、车一动不动"，
+                #   而且取决于心跳与段的相位关系，看起来是随机的。
+                ex.on_send_deferred()
+            return
+        if action.kind is ActionKind.ARRIVED:
+            self.get_logger().info(f"★ 已到达目标点（{action.reason}）")
+            self._publish_segment_status("ARRIVED", action.reason)
+        elif action.kind is ActionKind.FAILED:
+            self.get_logger().error(
+                f"★ 放弃目标点（{where}）：{action.reason}。"
+                f"车会停在当前位置，不会继续尝试。")
+            self._latch(f"segment FAILED {action.reason}")
+            self._publish_segment_status("FAILED", action.reason)
+
+    def _publish_segment_status(self, phase: str, detail: str = "") -> None:
+        ex = self.segment_executor
+        if ex is None or not hasattr(self, "segment_pub"):
+            return
+        msg = String()
+        msg.data = f"{phase} goal_seq={self._goal_seq} {ex.describe()}"
+        if detail:
+            msg.data += f" detail={detail}"
+        self.segment_pub.publish(msg)
+
+    def _on_goal(self, msg: PoseStamped) -> None:
+        ex = self.segment_executor
+        if ex is None:
+            return
+        if self.motion_blocked:
+            self.get_logger().error(
+                f"收到目标点但底盘已锁死（{self.block_reason}），拒绝执行")
+            self._publish_segment_status("REJECTED", self.block_reason)
+            return
+        # 位流不符 = 我们连"这台车是什么行为"都不知道，绝不能动。
+        # ★ 必须在这里**明确拒绝**，而不是"接受下来但什么都不发" ——
+        #   后者会让调用方以为目标在跑，然后一直等一个永远不会来的 ARRIVED。
+        if self.build_id_ok is False:
+            reason = (f"位流版本不符（板上 0x{self.build_id:08X}，期望 "
+                      f"{self.get_parameter('expected_build_id').value}），拒绝执行目标")
+            self.get_logger().error(f"★ {reason}")
+            self._publish_segment_status("REJECTED", reason)
+            return
+
+        # 目标可能在 map 系（RViz / Nav2 都发 map 系）。有 TF 就变换，没 TF 就只在
+        # 本来就是 odom 系时接受 —— 绝不"当它是 odom 直接用"，那会让车往错的方向跑。
+        frame = (msg.header.frame_id or "").strip()
+        pose_in = msg
+        if frame and frame != self.odom_frame:
+            # 去掉前导斜杠再比较：'/odom' 与 'odom' 是同一个系
+            if frame.lstrip("/") != self.odom_frame.lstrip("/"):
+                try:
+                    pose_in = self.tf_buffer.transform(
+                        msg, self.odom_frame, timeout=Duration(seconds=0.3))
+                except Exception as exc:                  # noqa: BLE001
+                    self.get_logger().error(
+                        f"目标点的坐标系是 {frame!r}，但拿不到它到 "
+                        f"{self.odom_frame!r} 的 TF，无法执行：{exc}")
+                    self._publish_segment_status("REJECTED", f"TF {frame}→odom 不可用")
+                    return
+
+        target = TargetPoint(
+            x=float(pose_in.pose.position.x),
+            y=float(pose_in.pose.position.y),
+            yaw=self._goal_yaw(pose_in),
+        )
+        self._goal_seq += 1
+        # 先停一下再开始：如果上一段还在跑，必须让固件把当前段 abort 掉，
+        # 否则新目标的第一段会被 `start_valid && !busy` 静默丢弃（:177）。
+        if ex.busy:
+            self._need_stop = True
+        ex.set_goal(target)
+        self.get_logger().info(
+            f"收到目标点 #{self._goal_seq}：({target.x:.3f}, {target.y:.3f})"
+            + (f" yaw={math.degrees(target.yaw):.1f}°" if target.yaw is not None else ""))
+        self._publish_segment_status("ACCEPTED")
+
+    def _goal_yaw(self, msg: PoseStamped):
+        """目标朝向。默认**不采用** —— 见 `goal_uses_yaw` 的说明。"""
+        if not self.get_parameter("goal_uses_yaw").value:
+            return None
+        q = msg.pose.orientation
+        if q.x == 0.0 and q.y == 0.0 and q.z == 0.0 and q.w == 0.0:
+            return None                     # 全零四元数 = "没填"，不是"朝向 0"
+        return yaw_from_quaternion(q.x, q.y, q.z, q.w)
+
+    def _abort_goal(self, reason: str) -> None:
+        """中止当前目标并停车（人工接管 / 参数越界 / 目标被替换）。"""
+        ex = self.segment_executor
+        if ex is None or not ex.active:
+            return
+        ex.cancel(reason)
+        self._inflight_segment = None
+        self._pending_segment_result = None
+        self._need_stop = True              # STOP 会把在跑的位置段 abort 掉
+        self.get_logger().warn(
+            f"★ 已中止当前目标：{reason}。"
+            f"（位置段是靠 STOP 中止的，见 top.v:121-125）")
+        self._publish_segment_status("ABORTED", reason)
 
     def _send_heartbeat(self) -> None:
         """静止/保持 ARM 时的喂狗。
@@ -626,12 +962,29 @@ class Acg720Driver(Node):
         if kind == int(Kind.POSITION_TELEMETRY):
             info = parse_position_telemetry(payload)
             self.position_busy = info['busy']
-            self.position_done = info['done']
+            self.position_progress = info['progress_counts']
+            # ★★ `done` 是**电平**，不是边沿。固件在段完成时置 `done=1`，
+            #    要到**下一段 start** 才清零（chassis_position_controller.v:178
+            #    清、:201/:225/:239/:258 置），而 0x84 是 20 Hz 周期广播的一部分
+            #    （见 acg720_firmware._packet 的 'position' 分支）——
+            #    所以段与段之间那几十毫秒里，同一个 `done=1` 会被报好几次。
+            #    如果照单全收，驱动会把上一段的完成帧当成**新段**的结果，
+            #    于是"还没走完就宣布走完"，车停在半路而且不报错。
+            #    这里只认上升沿。本工程真的踩过这一条（HIL 的 [6] 转到 89° 就停）。
+            rising = bool(info['done']) and not self._position_done_level
+            self._position_done_level = bool(info['done'])
+            self.position_done = bool(info['done'])
             if info['done']:
                 self.position_result = info['result_code']
+            if rising:
                 self.get_logger().info(
                     f"位置动作完成：result={info['result_code']} "
                     f"progress={info['progress_counts']}/{info['target_counts']}")
+                if self.segment_executor is not None:
+                    # ★ 只**记下来**，真正的"发下一段"放到控制拍的发送路径上做：
+                    #   串口写只允许有一个入口，否则限速和 SEQ 的记账会有两个说法。
+                    self._pending_segment_result = (
+                        int(info['result_code']), int(info['progress_counts']))
             return
         if kind == int(Kind.IMU):
             return                      # IMU 帧暂时只丢给 telemetry_raw 用量统计
@@ -783,6 +1136,14 @@ class Acg720Driver(Node):
         if self.cmd_timed_out:
             self.cmd_timed_out = False
             self.get_logger().info("收到新的 /cmd_vel，恢复运动")
+        # position 模式下 /cmd_vel 不是控制输入，而是**人工接管**信号：
+        # 摇杆永远该能压过自主导航。台架调试时这是保命开关。
+        if self.control_mode == "position" \
+                and self.get_parameter("cmd_vel_overrides_goal").value:
+            if abs(self.last_cmd_v) > 1e-3 or abs(self.last_cmd_w) > 1e-3:
+                self._abort_goal(
+                    f"收到非零 /cmd_vel（v={self.last_cmd_v:.3f} "
+                    f"w={self.last_cmd_w:.3f}），人工接管")
 
     def _on_status_timer(self) -> None:
         parts = [
@@ -810,6 +1171,15 @@ class Acg720Driver(Node):
                 self.last_move.turn_inner_ratio_q8))
             parts.append("achieved=(v={:.3f},w={:.3f})".format(
                 self.last_move.v, self.last_move.omega))
+        if self.segment_executor is not None:
+            # 分段导航的可观测性：目标、当前段、段计数、走过的距离、失败原因
+            parts.append("segments=({})".format(
+                self.segment_executor.describe().replace(" ", ",")))
+            parts.append(f"position_busy={self.position_busy}")
+            if self.segment_params is not None:
+                parts.append(
+                    f"seg_limits=(max_straight={self.segment_planner.max_counts_for_rpm(self.segment_params.straight_rpm)},"
+                    f"max_turn={self.segment_planner.max_counts_for_rpm(self.segment_params.turn_rpm)})")
         if self.block_reason:
             parts.append(f"blocked=({self.block_reason})")
         if self.last_cmd_time is not None:

@@ -363,6 +363,20 @@ def quaternion_from_yaw(yaw: float) -> Tuple[float, float, float, float]:
     return (0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0))
 
 
+def yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
+    """四元数 → 偏航角。等于把姿态投影到水平面再取绕 z 的转角。
+
+    ⚠ 全零四元数 `(0,0,0,0)` 是**无效**的，这里会算出 0.0，也就是"朝向 +x"。
+      很多消息工具在"朝向不关心"时就是这么填的 —— 调用方必须自己决定要不要
+      把 0.0 当成"真的朝 +x"。本工程的用法见 `acg720_driver._goal_yaw`：
+      默认**不采用**目标朝向（`goal_uses_yaw=false`），
+      而且即便打开，也把全零四元数当成"没填"而不是"朝向 0"。
+    """
+    siny = 2.0 * (w * z + x * y)
+    cosy = 1.0 - 2.0 * (y * y + z * z)
+    return wrap_angle(math.atan2(siny, cosy))
+
+
 @dataclass
 class Pose2D:
     x: float = 0.0

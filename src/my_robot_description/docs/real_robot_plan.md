@@ -33,13 +33,18 @@
 >   （帧拒绝、安全状态机、3.0 s 上限、故障自锁、ACK 单槽、位置环）。
 > * `acg720_driver`：真协议驱动节点，启动即校验位流 `build_id`，故障必吼。
 > * `acg720_simulator`：PTY 虚拟底盘，接上面那个模型，**没有硬件也能撞到真问题**。
-> * 测试：231 例纯函数 + 59 项 HIL + 33 项 launch 冒烟。
+> * `position_segments.py`：**分段导航**的规划器与执行状态机（纯逻辑）。
+> * 测试：349 例纯函数 + 59 项 HIL + 65 项分段导航 HIL + 33 项 launch 冒烟。
 >
-> ⚠ **第一阻塞项**：**连续导航被固件的 3.0 s 运行上限挡死。**
-> `0x02 MOVE` 连续跑 3.0 秒就锁存 `FAULT_RUN_LIMIT` 并切断使能，
-> 只能断电或"松开 S0 再按 S4"复位；**重发命令不能续期**（10 Hz 重发也一样触顶）。
-> 今天唯一能真正驱动真车的运动原语是 `0x05 POSITION`（分段走）。
-> 需要改什么、为什么、怎么验见
+> ⚠ **第一阻塞项已降级为"性能问题"**：固件的 3.0 s 运行上限挡的是
+> **连续的 `0x02 MOVE`**（跑满 3.0 秒就锁存 `FAULT_RUN_LIMIT`，只能断电或
+> "松开 S0 再按 S4"复位；**重发命令不能续期**，10 Hz 重发一样触顶）。
+> 但位置环**不受**这条限制（`chassis_safety_fsm.v:57-58` 的 `!position_active`），
+> 所以 `control_mode:=position` 用一串 `0x05 POSITION` 段**不改固件就能连续导航** ——
+> 实测单段连续跑 **8.26 s** 而 `fault=NONE`、2.5 m 目标走到 2.498 m。
+> 代价是**没有圆弧**（只有"转—直行—转"折线）且平均速度约 0.09 m/s。
+> 用法见 [`position_navigation.md`](position_navigation.md)。
+> 想要连续圆弧运动才需要 FPGA 变更，见
 > [`fpga_change_request.md`](fpga_change_request.md) —— **只需改一处**。
 >
 > ⚠ **第二阻塞项**：雷达型号还没定。用户已确认会加 2D 雷达（LD19 / RPLIDAR A1 级），
@@ -268,14 +273,16 @@ robot.launch.py
 |---|---|---|
 | `src/acg720_protocol_v1.py` | **新增**：真协议帧编解码（与厂商实现逐字节交叉核对） | ✅ 已做 |
 | `src/acg720_firmware.py` | **新增**：按 RTL 逐条复刻的固件行为模型 | ✅ 已做 |
+| `src/position_segments.py` | **新增**：分段导航的规划器 + 执行状态机（纯逻辑，无 ROS） | ✅ 已做 |
 | `src/drive_kinematics.py` | Twist ↔ 四轮 RPM、计数 ↔ 位姿、MOVE 反解 | ✅ 已做 |
 | `src/acg720_driver.py` | **重写**：底盘驱动节点（真协议 V1） | ✅ 已做 |
 | `src/acg720_simulator.py` | **重写**：PTY 虚拟底盘，接固件行为模型 | ✅ 已做 |
 | `docs/fpga_change_request.md` | **新增**：给 FPGA 的变更需求 | ✅ 已做 |
+| `docs/position_navigation.md` | **新增**：分段导航（不改固件的连续移动） | ✅ 已做 |
 | `urdf/acg720_real.urdf.xacro` | **新增**：真车 URDF（无 gz 插件/sensor） | ✅ 已做，几何值待实车复核 |
 | `launch/robot.launch.py` | **新增**：真机 bringup | ✅ 已做 |
 | `launch/nav.launch.py` | `use_sim_time` 提成参数；world 校验加条件 | ✅ 已改 |
-| `test/`（五个文件） | 231 例单测 + 59 项 HIL + 33 项冒烟 | ✅ 已做 |
+| `test/`（七个文件） | 349 例单测 + 59 项 HIL + 65 项分段导航 HIL + 33 项冒烟 | ✅ 已做 |
 | `docs/acg720_protocol.md` | **新增**：底盘驱动层文档 | ✅ 已做 |
 | `config/nav2_params.yaml` | **改**：`footprint`、`inflation_radius`、速度/加速度上限、AMCL 雷达参数 | ⏳ 待实车标定 |
 | `config/slam_toolbox.yaml` | **改**：`max_laser_range`、`minimum_time_interval` | ⏳ 待雷达型号确定 |
@@ -320,7 +327,8 @@ Docker 里的 Jazzy）；CPR 也在 RTL 注释里确认了。
   正好命中交接包示例里的 `POSITION(1, 25, 3232)` —— 两个来源互相印证。
 * **算力平台**：香橙派 5 Plus（RK3588，aarch64）。宿主是 Ubuntu 22.04 的
   Rockchip BSP 内核，**不改宿主系统**，用 `docker/` 在容器里跑 Noble + Jazzy。
-  板子上已验证：`platform_check.py` 无阻塞项、HIL 30/30、冒烟 20/20。
+  板子上已验证：`platform_check.py` 无阻塞项、`pytest` 226 passed/5 skipped、
+  HIL 59/59、冒烟 33/33。
 
 ### ⛔ 仍然挡路的
 
@@ -330,10 +338,16 @@ Docker 里的 Jazzy）；CPR 也在 RTL 注释里确认了。
    驱动的启动路径会校验它，不符就**拒绝一切运动命令**（fail-safe，
    不会按错误口径控制真车）。所以这一条不再需要"上车前盲猜"，
    但**第一次上电时应该看一眼驱动的启动日志**。
-2. **连续导航被固件的 3.0 s 运行上限挡住。** 这不是"还没做"，
-   是"做不了" —— 需要 FPGA 变更，见
+2. ~~**连续导航被固件的 3.0 s 运行上限挡住。**~~
+   **已降级**：连续 `0x02 MOVE` 仍然会被挡，但 `control_mode:=position`
+   （一串 `0x05 POSITION` 段）不改固件就能连续移动，见
+   [`position_navigation.md`](position_navigation.md)。
+   代价是没有圆弧、平均速度约 0.09 m/s。
+   想要连续圆弧运动才需要 FPGA 变更，见
    [`fpga_change_request.md`](fpga_change_request.md)。
-   现状下唯一能真正驱动真车的运动原语是 `0x05 POSITION`（分段走）。
+   ⚠ **新出现的代价**：分段导航一段发出后由 FPGA 走完（最长约 0.73 m /
+   ~8 s），主机**只能在段间中止**。所以动态避障必须靠"段间介入"设计，
+   不能指望段内 —— 这是接雷达后要专门验的一条。
 3. **雷达型号 / 驱动包 / 安装位姿都还没有。** 用户已确认会加 2D 雷达
    （LD19 / RPLIDAR A1 级），但具体型号未定。`/scan` 是 SLAM 与 AMCL 的前提，
    所以**没有它就无法验证①③两条功能**。`robot.launch.py` 因此默认
